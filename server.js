@@ -1,125 +1,118 @@
 const express = require("express");
 const cors = require("cors");
-require("dotenv").config();
+const { Client } = require("square");
 
-// Square SDK
-const { Client, Environment } = require("square");
-
-// Load env vars
-const {
-  SQUARE_ACCESS_TOKEN,
-  SQUARE_LOCATION_ID,
-  SQUARE_ENVIRONMENT,
-} = process.env;
-
-// Init Square client
+// ─────────────────────────────────────────────
+//  SQUARE CLIENT
+// ─────────────────────────────────────────────
 const squareClient = new Client({
-  accessToken: SQUARE_ACCESS_TOKEN,
-  environment:
-    SQUARE_ENVIRONMENT === "production"
-      ? Environment.Production
-      : Environment.Sandbox,
+  accessToken: process.env.SQUARE_ACCESS_TOKEN,
+  environment: process.env.SQUARE_ENVIRONMENT || "sandbox",
 });
 
 const catalogApi = squareClient.catalogApi;
-const ordersApi = squareClient.ordersApi;
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Root/health
+// ─────────────────────────────────────────────
+//  HEALTH CHECK
+// ─────────────────────────────────────────────
 app.get("/", (_req, res) => res.send("✅ API is running"));
 app.get("/health", (_req, res) =>
   res.json({ status: "ok", ts: new Date().toISOString() })
 );
 
-/**
- * ====== GET MENU (Square Catalog) ======
- * VAPI agent will call this tool to know what items exist
- */
-app.get("/api/menu", async (_req, res) => {
+// ─────────────────────────────────────────────
+//  GET MENU ITEMS FROM SQUARE
+// ─────────────────────────────────────────────
+app.get("/items", async (_req, res) => {
   try {
     const response = await catalogApi.listCatalog(undefined, "ITEM");
-    const items =
-      response.result.objects?.map((o) => ({
-        id: o.id,
-        name: o.itemData?.name,
-        price:
-          o.itemData?.variations?.[0]?.itemVariationData?.priceMoney?.amount /
-          100,
-      })) || [];
 
-    return res.status(200).json({ success: true, items });
+    const objects = response?.result?.objects || [];
+
+    // Convert Square item format into something useful
+    const items = objects
+      .filter((obj) => obj.type === "ITEM")
+      .map((item) => {
+        const variation = item.itemData?.variations?.[0];
+        const priceMoney = variation?.itemVariationData?.priceMoney;
+
+        return {
+          id: item.id,
+          name: item.itemData?.name || "Unnamed Item",
+          price: priceMoney ? priceMoney.amount / 100 : 0,
+        };
+      });
+
+    return res.json({ success: true, items });
   } catch (err) {
-    console.error("🔥 Error fetching menu:", err);
-    return res.status(200).json({
+    console.error("🔥 Square menu fetch error:", err);
+    return res.status(500).json({
       success: false,
-      message: "Failed to fetch menu",
-      debug: String(err),
+      error: String(err?.message || err),
     });
   }
 });
 
-/**
- * ====== CREATE ORDER ======
- * Called by VAPI tool "createOrder"
- */
+// ─────────────────────────────────────────────
+//  CREATE ORDER (placeholder - will wire to Square next)
+// ─────────────────────────────────────────────
 app.post("/api/create-order", async (req, res) => {
   try {
-    const { items_json, customer_name, customer_phone, notes } =
-      req.body || {};
+    const {
+      items_json,
+      customer_name,
+      customer_email,
+      customer_phone,
+      notes,
+    } = req.body || {};
 
     let items = [];
     try {
-      items = Array.isArray(items_json)
-        ? items_json
-        : JSON.parse(items_json || "[]");
-    } catch (e) {
-      items = [];
+      if (Array.isArray(items_json)) {
+        items = items_json;
+      } else if (typeof items_json === "string") {
+        const parsed = JSON.parse(items_json);
+        items = Array.isArray(parsed) ? parsed : [parsed];
+      }
+    } catch (_e) {}
+
+    if (!items || items.length === 0) {
+      items = [{ name: "Unspecified Item", quantity: 1, price: 0 }];
     }
 
-    // Prevent Square rejection: must have items
-    if (!items.length) {
-      items = [{ name: "Unknown item", quantity: 1, price: 0 }];
-    }
-
-    console.log("🧾 Order received from VAPI:", items);
-
-    // Build Square line items
-    const lineItems = items.map((i) => ({
-      name: i.name,
-      quantity: String(i.quantity || 1),
-      basePriceMoney: {
-        amount: Math.round((i.price || 0) * 100),
-        currency: "USD",
-      },
-    }));
-
-    const orderReq = {
-      order: {
-        locationId: SQUARE_LOCATION_ID,
-        lineItems,
-        note: notes || "",
-      },
-    };
-
-    const result = await ordersApi.createOrder({ order: orderReq.order });
+    console.log("📝 Received body:", JSON.stringify(req.body));
+    console.log("🧾 Items parsed:", items);
 
     return res.status(200).json({
       success: true,
-      message: "✅ Square order created",
-      squareResponse: result.result,
+      message: "Order data received (not yet submitted to Square).",
+      received: {
+        items,
+        customer_name,
+        customer_email,
+        customer_phone,
+        notes,
+      },
     });
   } catch (err) {
-    console.error("🔥 ORDER ERROR:", err);
+    console.error("🔥 create-order error:", err);
     return res.status(200).json({
-      success: false,
-      message: "Order received but Square call failed",
-      debug: String(err),
+      success: true,
+      message: "Order received, but error occurred. Check logs.",
+      error: String(err?.message || err),
     });
   }
 });
 
+// ─────────────────────────────────────────────
+//  SERVER
+// ─────────────────────────────────────────────
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 Server running on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
