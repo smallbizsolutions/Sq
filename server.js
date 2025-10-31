@@ -3,7 +3,21 @@ const { Client, Environment } = require('square');
 const crypto = require('crypto');
 
 const app = express();
-app.use(express.json());
+
+// --- FIX FOR DUPLICATE HEADERS ---
+// This replaces app.use(express.json()) and forces JSON parsing manually
+app.use((req, res, next) => {
+  let data = '';
+  req.on('data', chunk => (data += chunk));
+  req.on('end', () => {
+    try {
+      req.body = data ? JSON.parse(data) : {};
+    } catch {
+      req.body = {};
+    }
+    next();
+  });
+});
 
 // Initialize Square client
 const squareClient = new Client({
@@ -30,25 +44,33 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Create Order endpoint
+// --- CREATE ORDER ENDPOINT ---
 app.post('/api/create-order', async (req, res) => {
   console.log('Incoming payload:', JSON.stringify(req.body, null, 2));
+
   try {
     let items_json, customer_name, customer_phone, customer_email, notes, toolCallId;
 
-    // Support both Vapi structure and test requests
+    // Handle both Vapi toolCalls and manual test payloads
     if (req.body.message && req.body.message.toolCalls) {
       const toolCall = req.body.message.toolCalls[0];
       toolCallId = toolCall.id;
-      ({ items_json, customer_name, customer_phone, customer_email, notes } = toolCall.function.arguments);
+      ({ items_json, customer_name, customer_phone, customer_email, notes } =
+        toolCall.function.arguments);
     } else {
       ({ items_json, customer_name, customer_phone, customer_email, notes } = req.body);
       toolCallId = 'manual';
     }
 
-    console.log('Parsed variables:', { items_json, customer_name, customer_phone, customer_email, notes });
+    console.log('Parsed variables:', {
+      items_json,
+      customer_name,
+      customer_phone,
+      customer_email,
+      notes,
+    });
 
-    // Parse item JSON
+    // Parse the items JSON
     let items;
     try {
       items = JSON.parse(items_json);
@@ -56,12 +78,12 @@ app.post('/api/create-order', async (req, res) => {
       throw new Error('Invalid items_json format');
     }
 
-    // Build order line items
+    // Build Square line items
     const lineItems = items.map(item => ({
       name: item.name,
       quantity: item.quantity.toString(),
       basePriceMoney: {
-        amount: Math.round(parseFloat(item.price) * 100),
+        amount: Math.round(parseFloat(item.price) * 100), // dollars → cents
         currency: 'USD',
       },
       note: item.customization || '',
@@ -84,7 +106,9 @@ app.post('/api/create-order', async (req, res) => {
     const order = orderResponse.result.order;
     const totalAmount = order.totalMoney ? order.totalMoney.amount / 100 : 0;
 
-    const resultMessage = `✅ Order created successfully! Order ID: ${order.id}. Total: $${totalAmount.toFixed(2)}`;
+    const message = `✅ Order created successfully! Order ID: ${order.id}. Total: $${totalAmount.toFixed(
+      2
+    )}`;
 
     res.json({
       results: [
@@ -94,13 +118,14 @@ app.post('/api/create-order', async (req, res) => {
             success: true,
             order_id: order.id,
             total: totalAmount,
-            message: resultMessage,
+            message,
           }),
         },
       ],
     });
   } catch (error) {
     console.error('Order creation error:', error);
+
     res.status(500).json({
       results: [
         {
@@ -115,6 +140,7 @@ app.post('/api/create-order', async (req, res) => {
   }
 });
 
+// Start the server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
