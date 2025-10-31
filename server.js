@@ -4,26 +4,32 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json());
 
-// this route receives order data from Vapi and forwards it to Square
+// Health check route (optional)
+app.get("/", (req, res) => {
+  res.send("Square Order API running!");
+});
+
+// Create order route
 app.post("/order", async (req, res) => {
   try {
-    const squareResponse = await fetch("https://connect.squareupsandbox.com/v2/orders", {
+    const response = await fetch("https://connect.squareupsandbox.com/v2/orders", {
       method: "POST",
       headers: {
+        "Authorization": `Bearer ${process.env.SQUARE_ACCESS_TOKEN}`,
         "Content-Type": "application/json",
-        "Square-Version": "2025-10-16",
-        "Authorization": `Bearer ${process.env.SQUARE_TOKEN}`
+        "Square-Version": "2025-10-16"
       },
       body: JSON.stringify(req.body)
     });
 
-    const data = await squareResponse.json();
-    res.status(squareResponse.status).json(data);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Internal error forwarding to Square" });
+    const data = await response.json();
+    res.status(response.status).json(data);
+  } catch (error) {
+    console.error("Error creating order:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-app.get("/", (_, res) => res.send("Square proxy running"));
-app.listen(3000, () => console.log("Server running on port 3000"));
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
