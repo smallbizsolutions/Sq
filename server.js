@@ -29,7 +29,15 @@ app.post('/api/create-order', async (req, res) => {
   try {
     const { message } = req.body;
     const toolCall = message.toolCalls[0];
-    const { items, customer_name, customer_phone, customer_email, notes } = toolCall.function.arguments;
+    const { items_json, customer_name, customer_phone, customer_email, notes } = toolCall.function.arguments;
+    
+    // Parse the items JSON string
+    let items;
+    try {
+      items = JSON.parse(items_json);
+    } catch (parseError) {
+      throw new Error('Invalid items format. Expected JSON string.');
+    }
 
     // Build line items for Square
     const lineItems = items.map(item => ({
