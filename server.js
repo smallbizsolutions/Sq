@@ -4,12 +4,12 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json());
 
-// Health check route (optional)
+// Quick sanity check
 app.get("/", (req, res) => {
-  res.send("Square Order API running!");
+  res.send("✅ Square Order Proxy is live!");
 });
 
-// Create order route
+// Proxy route for Vapi to call
 app.post("/order", async (req, res) => {
   try {
     const response = await fetch("https://connect.squareupsandbox.com/v2/orders", {
@@ -25,11 +25,11 @@ app.post("/order", async (req, res) => {
     const data = await response.json();
     res.status(response.status).json(data);
   } catch (error) {
-    console.error("Error creating order:", error);
-    res.status(500).json({ error: "Internal server error" });
+    console.error("🚨 Error creating order:", error);
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
-// Start server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(process.env.PORT || 3000, () => {
+  console.log("✅ Server running");
+});
