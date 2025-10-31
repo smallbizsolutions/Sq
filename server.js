@@ -1,5 +1,5 @@
-import express from "express";
-import cors from "cors";
+const express = require("express");
+const cors = require("cors");
 
 const app = express();
 
@@ -44,7 +44,7 @@ app.post("/api/create-order", async (req, res) => {
       return res.status(400).json({ error: "No items provided" });
     }
 
-    // Log what we received (for debugging)
+    // Log what we received
     console.log("💥 Order received:", {
       items,
       customer_name,
@@ -53,7 +53,7 @@ app.post("/api/create-order", async (req, res) => {
       notes,
     });
 
-    // Placeholder for Square API call (works for now)
+    // Placeholder for Square API
     res.status(200).json({
       success: true,
       message: "Order created successfully!",
