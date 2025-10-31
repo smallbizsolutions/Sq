@@ -1,11 +1,18 @@
+// --- Imports ---
 const express = require('express');
 const { Client, Environment } = require('square');
 const crypto = require('crypto');
+const cors = require('cors');
 
+// --- App Setup ---
 const app = express();
+const PORT = process.env.PORT || 8080;
 
-// --- FIX FOR DUPLICATE HEADERS ---
-// This replaces app.use(express.json()) and forces JSON parsing manually
+// --- Enable CORS for Vapi ---
+app.use(cors());
+app.options('*', cors());
+
+// --- Fix for duplicate headers / manual JSON parsing ---
 app.use((req, res, next) => {
   let data = '';
   req.on('data', chunk => (data += chunk));
@@ -19,7 +26,7 @@ app.use((req, res, next) => {
   });
 });
 
-// Initialize Square client
+// --- Initialize Square client ---
 const squareClient = new Client({
   accessToken: process.env.SQUARE_ACCESS_TOKEN,
   environment:
@@ -30,12 +37,12 @@ const squareClient = new Client({
 
 const LOCATION_ID = process.env.SQUARE_LOCATION_ID;
 
-// Root route
+// --- Root route ---
 app.get('/', (req, res) => {
   res.send('✅ Square API server is running');
 });
 
-// Health check
+// --- Health check ---
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -44,14 +51,14 @@ app.get('/health', (req, res) => {
   });
 });
 
-// --- CREATE ORDER ENDPOINT ---
+// --- CREATE ORDER ---
 app.post('/api/create-order', async (req, res) => {
-  console.log('Incoming payload:', JSON.stringify(req.body, null, 2));
+  console.log('💥 RAW BODY:', req.body);
 
   try {
+    // Handle both manual and Vapi payloads
     let items_json, customer_name, customer_phone, customer_email, notes, toolCallId;
 
-    // Handle both Vapi toolCalls and manual test payloads
     if (req.body.message && req.body.message.toolCalls) {
       const toolCall = req.body.message.toolCalls[0];
       toolCallId = toolCall.id;
@@ -70,7 +77,21 @@ app.post('/api/create-order', async (req, res) => {
       notes,
     });
 
-    // Parse the items JSON
+    if (!items_json) {
+      return res.status(400).json({
+        results: [
+          {
+            toolCallId,
+            result: JSON.stringify({
+              success: false,
+              message: '❌ Missing items_json in request body',
+            }),
+          },
+        ],
+      });
+    }
+
+    // Parse item list
     let items;
     try {
       items = JSON.parse(items_json);
@@ -83,12 +104,13 @@ app.post('/api/create-order', async (req, res) => {
       name: item.name,
       quantity: item.quantity.toString(),
       basePriceMoney: {
-        amount: Math.round(parseFloat(item.price) * 100), // dollars → cents
+        amount: Math.round(parseFloat(item.price) * 100), // convert dollars → cents
         currency: 'USD',
       },
       note: item.customization || '',
     }));
 
+    // Create order
     const { ordersApi } = squareClient;
     const orderResponse = await ordersApi.createOrder({
       order: {
@@ -97,7 +119,7 @@ app.post('/api/create-order', async (req, res) => {
         metadata: {
           customer_name: customer_name || '',
           customer_phone: customer_phone || '',
-          source: 'vapi_test',
+          source: 'vapi_create_order',
         },
       },
       idempotencyKey: crypto.randomUUID(),
@@ -124,15 +146,14 @@ app.post('/api/create-order', async (req, res) => {
       ],
     });
   } catch (error) {
-    console.error('Order creation error:', error);
-
+    console.error('❌ Order creation error:', error);
     res.status(500).json({
       results: [
         {
           toolCallId: 'error',
           result: JSON.stringify({
             success: false,
-            message: `❌ Failed to create order: ${error.message}`,
+            message: `Failed to create order: ${error.message}`,
           }),
         },
       ],
@@ -140,8 +161,7 @@ app.post('/api/create-order', async (req, res) => {
   }
 });
 
-// Start the server
-const PORT = process.env.PORT || 3000;
+// --- Start Server ---
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
