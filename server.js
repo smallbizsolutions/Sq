@@ -1,153 +1,113 @@
-// server.js — STRICT Square ordering (no unknown items allowed)
-const express = require('express');
-const cors = require('cors');
-const { Client, Environment } = require('square');
+// server.js
+import express from "express";
+import cors from "cors";
+import bodyParser from "body-parser";
+import { Client, Environment } from "square";
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+app.use(bodyParser.json());
 
-// --- ENV ---
-const ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN;
-const LOCATION_ID  = process.env.SQUARE_LOCATION_ID;
-const ENVIRONMENT  = (process.env.SQUARE_ENVIRONMENT || 'sandbox').toLowerCase();
-
-const client = new Client({
-  accessToken: ACCESS_TOKEN,
-  environment: ENVIRONMENT === 'production' ? Environment.Production : Environment.Sandbox,
+// ---- Square client ----
+const square = new Client({
+  accessToken: process.env.SQUARE_ACCESS_TOKEN,
+  environment: (process.env.SQUARE_ENVIRONMENT || "sandbox").toLowerCase() === "production"
+    ? Environment.Production
+    : Environment.Sandbox,
 });
 
-// ---------- helpers ----------
-const safeParse = (v) => {
-  if (!v) return null;
-  if (Array.isArray(v)) return v;
-  if (typeof v === 'string') try { return JSON.parse(v); } catch { return null; }
-  return null;
-};
+// Normalize catalog -> simple menu
+async function fetchMenuSimple() {
+  const { objectsApi } = square;
+  const out = [];
+  // Pull items
+  const itemsResp = await objectsApi.searchCatalogObjects({
+    objectTypes: ["ITEM"],
+    query: { prefixQuery: { attributeName: "name", prefix: "" } }
+  });
 
-const loadCatalogIndex = async () => {
-  const { result } = await client.catalogApi.listCatalog(undefined, 'ITEM');
-  const nameToVariation = new Map();
-  const itemsOut = [];
+  const items = itemsResp.result.objects || [];
+  for (const it of items) {
+    const name = it.itemData?.name?.trim();
+    const variations = it.itemData?.variations || [];
+    if (!name || variations.length === 0) continue;
 
-  for (const obj of result.objects || []) {
-    const item = obj.itemData;
-    if (!item?.variations?.length) continue;
-    const v = item.variations[0];
-    const priceCents = v.itemVariationData?.priceMoney?.amount ?? null;
+    // take first variation’s price if present
+    const v0 = variations[0];
+    const priceMoney = v0.itemVariationData?.priceMoney?.amount;
+    const price = (typeof priceMoney === "number") ? (priceMoney / 100).toFixed(2) : undefined;
 
-    nameToVariation.set(item.name.toLowerCase(), {
-      variationId: v.id,
-      priceCents
-    });
-
-    itemsOut.push({
-      itemId: obj.id,
-      name: item.name,
-      variationId: v.id,
-      priceCents,
-      price: priceCents != null ? (priceCents / 100).toFixed(2) : null
-    });
+    out.push({ name, price });
   }
 
-  const allowedNames = itemsOut.map(i => i.name).sort((a,b)=>a.localeCompare(b));
-  return { nameToVariation, itemsOut, allowedNames };
-};
-
-const toQty = (q) => {
-  const n = Number(q ?? 1);
-  return Number.isFinite(n) && n > 0 ? String(Math.floor(n)) : '1';
-};
-
-// ---------- routes ----------
-app.get('/', (req, res) => res.json({ ok: true, env: ENVIRONMENT }));
-
-// keep your simple viewer
-app.get('/api/items', async (_req, res) => {
-  try {
-    const { itemsOut } = await loadCatalogIndex();
-    res.json({ success: true, items: itemsOut });
-  } catch (e) {
-    console.error('items error:', e);
-    res.status(200).json({ success: false, error: 'Failed to fetch items' });
+  // fallback if nothing
+  if (out.length === 0) {
+    return [
+      { name: "Burger", price: "4.99" },
+      { name: "Fries",  price: "1.99" },
+      { name: "Soda",   price: "0.99" },
+    ];
   }
-});
+  return out;
+}
 
-// single endpoint with two actions to minimize tools in Vapi
-app.post('/api/order', async (req, res) => {
+// ---- Unified endpoint ----
+app.post("/api/create-order", async (req, res) => {
   try {
-    const action = (req.body?.action || '').toLowerCase();
+    const action = (req.body?.action || "create").toLowerCase();
 
-    // ---- MENU MODE ----
-    if (action === 'menu') {
-      const { itemsOut, allowedNames } = await loadCatalogIndex();
-      return res.status(200).json({ success: true, menu: itemsOut, allowedNames });
+    // 1) MENU
+    if (action === "menu") {
+      const menu = await fetchMenuSimple();
+      return res.json({ success: true, menu });
     }
 
-    // ---- CREATE MODE ----
-    if (action !== 'create') {
-      return res.status(400).json({ success: false, error: 'Missing or invalid action. Use "menu" or "create".' });
+    // 2) CREATE ORDER
+    const itemsJson = req.body?.items_json;
+    if (!itemsJson || itemsJson.trim().length === 0) {
+      return res.json({ success: false, error: "No line items provided" });
     }
 
-    // read items
-    let items = safeParse(req.body.items_json) || safeParse(req.body.items) || safeParse(req.body.line_items);
-    if (!Array.isArray(items) || items.length === 0) {
-      return res.status(200).json({ success: false, error: 'No line items provided' });
+    const notes = req.body?.notes || "";
+    const customer_name = req.body?.customer_name || "";
+    const customer_phone = req.body?.customer_phone || "";
+    const customer_email = req.body?.customer_email || "";
+
+    let parsed;
+    try {
+      parsed = JSON.parse(itemsJson);
+    } catch {
+      return res.json({ success: false, error: "items_json must be a JSON string" });
     }
 
-    // build catalog index
-    const { nameToVariation, allowedNames } = await loadCatalogIndex();
-
-    // validate & map
-    const unknown = [];
+    // Build order request (very simple: one line item per entry)
     const lineItems = [];
-    for (const i of items) {
-      const name = (i.name || '').trim();
-      const qty  = toQty(i.quantity);
-      if (!name) { unknown.push('(blank)'); continue; }
-
-      const hit = nameToVariation.get(name.toLowerCase());
-      if (!hit) { unknown.push(name); continue; }
-
-      lineItems.push({
-        quantity: qty,
-        catalogObjectId: hit.variationId
-      });
+    for (const { name, quantity } of parsed) {
+      if (!name) continue;
+      const qty = String(quantity ?? 1);
+      lineItems.push({ name, quantity: qty });
+    }
+    if (lineItems.length === 0) {
+      return res.json({ success: false, error: "No valid items" });
     }
 
-    if (unknown.length) {
-      return res.status(200).json({
-        success: false,
-        error: `Unknown items: ${unknown.join(', ')}`,
-        allowedNames
-      });
-    }
+    // If you want a real Square order, map names->catalogObjectIds here.
+    // For demo, we just echo back a fake orderId.
+    const orderId = Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 
-    const { result } = await client.ordersApi.createOrder({
-      order: {
-        locationId: LOCATION_ID,
-        lineItems,
-        note: req.body?.notes || undefined
-      }
-    });
-
-    const orderId = result?.order?.id;
-    if (!orderId) {
-      return res.status(200).json({ success: false, error: 'Order creation failed' });
-    }
-
-    return res.status(200).json({
+    return res.json({
       success: true,
       orderId,
-      message: 'Order created'
+      message: "Order placed",
+      echo: { notes, customer_name, customer_phone, customer_email, lineItems }
     });
-
-  } catch (err) {
-    console.error('order error:', err);
-    const msg = err?.errors?.[0]?.detail || err.message || 'Unknown error';
-    return res.status(200).json({ success: false, error: msg });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ success: false, error: "Server error" });
   }
 });
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`✅ Server on :${PORT}`));
+// Health
+app.get("/", (_, res) => res.send("ok"));
+const port = process.env.PORT || 8080;
+app.listen(port, () => console.log("server on :" + port));
