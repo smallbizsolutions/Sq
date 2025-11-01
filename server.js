@@ -1,156 +1,188 @@
-// server.js
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
+import express from "express";
+import cors from "cors";
 
+/** --------- ENV --------- */
 const {
-  Client,
-  Environment,
-} = require('@square/square');
+  SQUARE_ACCESS_TOKEN,
+  SQUARE_LOCATION_ID,
+  SQUARE_ENVIRONMENT = "sandbox"
+} = process.env;
 
+if (!SQUARE_ACCESS_TOKEN || !SQUARE_LOCATION_ID) {
+  console.error("Missing SQUARE_ACCESS_TOKEN or SQUARE_LOCATION_ID env vars.");
+}
+
+const BASE =
+  SQUARE_ENVIRONMENT === "production"
+    ? "https://connect.squareup.com"
+    : "https://connect.squareupsandbox.com";
+
+/** --------- APP --------- */
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN;
-const LOCATION_ID = process.env.SQUARE_LOCATION_ID;
-const ENV = (process.env.SQUARE_ENVIRONMENT || 'sandbox').toLowerCase() === 'production'
-  ? Environment.Production
-  : Environment.Sandbox;
-
-if (!ACCESS_TOKEN || !LOCATION_ID) {
-  console.error('Missing SQUARE_ACCESS_TOKEN or SQUARE_LOCATION_ID');
-}
-
-const sq = new Client({
-  accessToken: ACCESS_TOKEN,
-  environment: ENV,
-});
-
-const catalogApi = sq.catalogApi;
-const ordersApi  = sq.ordersApi;
-
-// in-memory cache of menu [{name, variationId, priceCents}]
-let MENU = [];
-
-// pull items once on boot, and on demand
-async function loadMenu() {
-  const { result } = await catalogApi.listCatalog(undefined, 'ITEM');
-  const items = (result.objects || [])
-    .filter(o => o.type === 'ITEM')
-    .map(o => {
-      const item = o.itemData;
-      const v = (item?.variations || [])[0];
-      const price = v?.itemVariationData?.priceMoney?.amount ?? 0;
-      return {
-        itemId: o.id,
-        name: item?.name?.trim() || 'Unnamed',
-        variationId: v?.id,
-        priceCents: Number(price),
-        price: (Number(price) / 100).toFixed(2),
-      };
-    })
-    .filter(x => x.variationId);
-  MENU = items;
-  return MENU;
-}
-
-// health
-app.get('/health', (_, res) => res.json({ ok: true }));
-
-// get menu (and auto-refresh cache if empty)
-app.get('/api/items', async (_, res) => {
-  try {
-    if (!MENU.length) await loadMenu();
-    res.json({ success: true, items: MENU });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ success: false, error: 'Failed to fetch items' });
-  }
-});
-
-// simple formatted menu for Vapi "getMenu" tool (reads cleanly)
-app.get('/api/menu', async (_, res) => {
-  try {
-    if (!MENU.length) await loadMenu();
-    const list = MENU.map(i => `${i.name} $${i.price}`).join(', ');
-    res.json({ success: true, text: `Our menu: ${list}.` });
-  } catch (e) {
-    res.status(500).json({ success: false, error: 'Menu unavailable' });
-  }
-});
-
-// create order
-// body: { items_json: stringified [{name,quantity}], customer_name?, customer_phone?, notes? }
-app.post('/api/create-order', async (req, res) => {
-  try {
-    const { items_json, customer_name, customer_phone, notes } = req.body || {};
-    if (!items_json) return res.status(400).json({ success: false, error: 'items_json required' });
-
-    if (!MENU.length) await loadMenu();
-
-    let requested;
-    try { requested = JSON.parse(items_json); }
-    catch { return res.status(400).json({ success: false, error: 'items_json must be valid JSON' }); }
-
-    if (!Array.isArray(requested) || !requested.length) {
-      return res.status(400).json({ success: false, error: 'No line items provided' });
+/** Small helper to call Square REST */
+async function sq(path, init = {}) {
+  const res = await fetch(`${BASE}${path}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${SQUARE_ACCESS_TOKEN}`,
+      "Content-Type": "application/json",
+      ...(init.headers || {})
     }
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = data?.errors?.map(e => e.detail).join("; ") || res.statusText;
+    throw new Error(`Square ${res.status} ${path} – ${msg}`);
+  }
+  return data;
+}
 
-    // map names to catalog variations (case-insensitive exact match)
-    const nameMap = new Map(MENU.map(m => [m.name.toLowerCase(), m]));
-    const lineItems = [];
+/** Health */
+app.get("/", (_, r) =>
+  r.json({ ok: true, env: SQUARE_ENVIRONMENT, location: SQUARE_LOCATION_ID })
+);
 
-    for (const r of requested) {
-      const q = Number(r.quantity ?? 1);
-      const key = String(r.name || '').trim().toLowerCase();
-      const found = nameMap.get(key);
-      if (!found) {
-        return res.status(400).json({ success: false, error: `Unknown item: ${r.name}` });
-      }
-      lineItems.push({
-        catalogObjectId: found.variationId,
-        quantity: String(q > 0 ? q : 1),
+/** Get menu (ITEMs with first variation + price) */
+app.get("/api/items", async (req, res) => {
+  try {
+    const out = [];
+    let cursor = undefined;
+
+    do {
+      const q = new URLSearchParams({ types: "ITEM", ...(cursor && { cursor }) });
+      const data = await sq(`/v2/catalog/list?${q.toString()}`);
+      cursor = data.cursor;
+
+      (data.objects || []).forEach(obj => {
+        const item = obj.item_data;
+        if (!item) return;
+
+        // Find first sellable variation with a price
+        const variations = (item.variations || [])
+          .map(v => ({
+            variationId: v.id,
+            priceCents: v.item_variation_data?.price_money?.amount ?? null
+          }))
+          .filter(v => v.priceCents !== null);
+
+        if (variations.length === 0) return;
+
+        const first = variations[0];
+        out.push({
+          itemId: obj.id,
+          name: item.name,
+          variationId: first.variationId,
+          priceCents: first.priceCents,
+          price: (first.priceCents / 100).toFixed(2)
+        });
       });
+    } while (cursor);
+
+    // Optional: keep it predictable
+    out.sort((a, b) => a.name.localeCompare(b.name));
+    res.json({ success: true, items: out });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err.message || err) });
+  }
+});
+
+/** Create order
+ * Body:
+ * {
+ *   items_json: stringified array of { name?: string, variationId?: string, quantity: number }
+ *   customer_name?: string
+ *   customer_email?: string
+ *   customer_phone?: string
+ *   notes?: string
+ * }
+ */
+app.post("/api/create-order", async (req, res) => {
+  try {
+    let { items_json, customer_name, customer_email, customer_phone, notes } = req.body || {};
+    if (!items_json) {
+      return res.status(400).json({ success: false, error: "items_json required" });
     }
 
-    const order = {
-      locationId: LOCATION_ID,
-      lineItems,
-      fulfillments: [], // no fulfillment or payment in this demo
-      // drop customer info into order `note` so we can see it in logs
-      note: [
-        notes ? `Notes: ${notes}` : null,
-        customer_name ? `Name: ${customer_name}` : null,
-        customer_phone ? `Phone: ${customer_phone}` : null,
-      ].filter(Boolean).join(' | ')
+    // Parse incoming items
+    let items = items_json;
+    if (typeof items_json === "string") items = JSON.parse(items_json);
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, error: "No line items provided" });
+    }
+
+    // Make sure we have variationIds. If only names were provided, map them.
+    const needLookup = items.some(it => !it.variationId);
+    let menuByName = {};
+    if (needLookup) {
+      const menuResp = await (await fetch(`${req.protocol}://${req.get("host")}/api/items`)).json();
+      (menuResp.items || []).forEach(i => (menuByName[i.name.toLowerCase()] = i));
+    }
+
+    const line_items = [];
+    for (const it of items) {
+      const qty = String(Math.max(1, parseInt(it.quantity || 1, 10)));
+      let variationId = it.variationId;
+
+      if (!variationId && it.name) {
+        const hit = menuByName[it.name.toLowerCase()];
+        if (hit) variationId = hit.variationId;
+      }
+      if (!variationId) {
+        return res.status(400).json({
+          success: false,
+          error: `Unknown item: ${it.name || "(no name)"}`
+        });
+      }
+      line_items.push({ quantity: qty, catalog_object_id: variationId });
+    }
+
+    const idempotency_key = `ord_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+    const body = {
+      idempotency_key,
+      order: {
+        location_id: SQUARE_LOCATION_ID,
+        line_items,
+        ...(notes ? { note: notes } : {})
+      }
     };
 
-    const { result } = await ordersApi.createOrder({ order });
-    const orderId = result.order?.id;
+    const created = await sq(`/v2/orders`, {
+      method: "POST",
+      body: JSON.stringify(body)
+    });
 
-    return res.json({
+    const orderId = created?.order?.id || null;
+    res.json({
       success: true,
       orderId,
-      message: orderId ? 'Order created (no payment attached in sandbox demo)' : 'Created, but no ID returned',
+      message: orderId ? "Order created." : "Order created (no id returned)."
     });
-  } catch (e) {
-    console.error('create-order error:', e);
-    const msg = e?.result?.errors?.[0]?.detail || e.message || 'Create order failed';
-    res.status(500).json({ success: false, error: msg });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err.message || err) });
   }
 });
 
-// retrieve order for verification in browser
-app.get('/api/order/:id', async (req, res) => {
+/** Quick viewer for recent orders (helps you verify without hunting around UI) */
+app.get("/api/orders", async (req, res) => {
   try {
-    const { result } = await ordersApi.retrieveOrder(req.params.id);
-    res.json({ success: true, order: result.order });
-  } catch (e) {
-    const msg = e?.result?.errors?.[0]?.detail || e.message || 'Retrieve failed';
-    res.status(500).json({ success: false, error: msg });
+    const data = await sq(`/v2/orders/search`, {
+      method: "POST",
+      body: JSON.stringify({
+        location_ids: [SQUARE_LOCATION_ID],
+        query: { sort: { sort_field: "CREATED_AT", sort_order: "DESC" } },
+        limit: 20
+      })
+    });
+    res.json({ success: true, orders: data?.orders || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err.message || err) });
   }
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`API running on :${PORT}`));
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
