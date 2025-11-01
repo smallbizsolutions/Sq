@@ -1,4 +1,4 @@
-// Robust Square sandbox order API for Vapi
+// server.js — Square sandbox order API for Vapi (name or variationId)
 const express = require('express');
 const cors = require('cors');
 const { Client, Environment } = require('square');
@@ -8,13 +8,9 @@ app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
 // ---- ENV ----
-const ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN;    // EAAA...
-const LOCATION_ID  = process.env.SQUARE_LOCATION_ID;     // L8CJJ792FCGGT
+const ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN;
+const LOCATION_ID  = process.env.SQUARE_LOCATION_ID;
 const ENVIRONMENT  = (process.env.SQUARE_ENVIRONMENT || 'sandbox').toLowerCase();
-
-if (!ACCESS_TOKEN || !LOCATION_ID) {
-  console.warn('⚠️ Missing SQUARE_ACCESS_TOKEN or SQUARE_LOCATION_ID env var.');
-}
 
 const client = new Client({
   accessToken: ACCESS_TOKEN,
@@ -22,67 +18,59 @@ const client = new Client({
 });
 
 // ---- HELPERS ----
-const parseItemsFromBody = (body) => {
-  // Accept items in many shapes:
-  //  - body.items_json (string or array)
-  //  - body.items (array)
-  //  - body.line_items (array)
-  //  Each element: { variationId: string, quantity: number }
-  let src =
-    body.items ??
-    body.line_items ??
-    body.items_json;
-
-  // If it's a string, try to JSON.parse
-  if (typeof src === 'string') {
-    try { src = JSON.parse(src); } catch { src = null; }
-  }
-
-  // Normalize and validate
+const parseIncomingItems = (body) => {
+  // Accept many shapes: items_json (string/array), items, line_items
+  let src = body.items ?? body.line_items ?? body.items_json;
+  if (typeof src === 'string') { try { src = JSON.parse(src); } catch { /* ignore */ } }
   if (!Array.isArray(src)) return [];
-  const normalized = src
-    .map(it => ({
-      variationId: it.variationId || it.catalogObjectId || it.id,
-      quantity: String(it.quantity ?? 1),
-    }))
-    .filter(it => typeof it.variationId === 'string' && it.variationId.length > 0);
+  return src.map(i => ({
+    // allow variationId OR name
+    variationId: i.variationId || i.catalogObjectId || i.id || null,
+    name: i.name || i.itemName || null,
+    quantity: String(i.quantity ?? 1),
+  }));
+};
 
-  return normalized;
+const resolveNamesToVariations = async (items) => {
+  // For any item with a name but no variationId, search catalog by text and pick first variation
+  const needLookup = items.filter(i => !i.variationId && i.name);
+  for (const it of needLookup) {
+    try {
+      const { result } = await client.catalogApi.searchCatalogObjects({
+        objectTypes: ['ITEM'],
+        query: { textFilter: it.name }
+      });
+      const found = (result?.objects || []).find(o =>
+        o.itemData?.name?.toLowerCase() === it.name.toLowerCase()
+      ) || (result?.objects || [])[0];
+
+      const v = found?.itemData?.variations?.[0];
+      if (v?.id) it.variationId = v.id;
+    } catch { /* keep going */ }
+  }
+  return items.filter(i => i.variationId); // drop anything unresolved
 };
 
 const pickFirstCatalogVariation = async () => {
-  // Fallback: grab first ITEM + first VARIATION for demo reliability
   const { result } = await client.catalogApi.listCatalog(undefined, 'ITEM');
   const items = (result.objects || [])
-    .filter(o => o.type === 'ITEM' && o.itemData && (o.itemData.variations || []).length);
+    .filter(o => o.type === 'ITEM' && o.itemData?.variations?.length);
   if (!items.length) return null;
-
-  const firstVar = items[0].itemData.variations[0];
-  return {
-    variationId: firstVar.id,
-    quantity: '1',
-    name: items[0].itemData.name,
-  };
+  return { variationId: items[0].itemData.variations[0].id, quantity: '1' };
 };
 
 // ---- ROUTES ----
-
-// Health
 app.get('/', (req, res) => res.json({ ok: true, env: ENVIRONMENT }));
 
-// List simple menu for the agent (id + name + first variation + price)
 app.get('/api/items', async (req, res) => {
   try {
     const { result } = await client.catalogApi.listCatalog(undefined, 'ITEM');
     const out = [];
-
     for (const obj of result.objects || []) {
       const item = obj.itemData;
-      if (!item || !item.variations || !item.variations.length) continue;
-
+      if (!item?.variations?.length) continue;
       const v = item.variations[0];
       const priceCents = v.itemVariationData?.priceMoney?.amount ?? null;
-
       out.push({
         itemId: obj.id,
         name: item.name,
@@ -91,7 +79,6 @@ app.get('/api/items', async (req, res) => {
         price: priceCents != null ? (priceCents / 100).toFixed(2) : null,
       });
     }
-
     res.json({ success: true, items: out });
   } catch (err) {
     console.error('items error:', err);
@@ -99,54 +86,46 @@ app.get('/api/items', async (req, res) => {
   }
 });
 
-// Create order
 app.post('/api/create-order', async (req, res) => {
   try {
-    let lineReq = parseItemsFromBody(req.body);
+    let items = parseIncomingItems(req.body);
+    if (items.length) items = await resolveNamesToVariations(items);
 
-    // If caller sends nothing valid, auto-fill first catalog item (sandbox demo)
-    let fallbackUsed = false;
-    if (!lineReq.length) {
-      const fallback = await pickFirstCatalogVariation();
-      if (!fallback) {
-        return res.status(200).json({ success: false, error: 'No line items provided' });
-      }
-      lineReq = [{ variationId: fallback.variationId, quantity: '1' }];
-      fallbackUsed = true;
+    let usedFallback = false;
+    if (!items.length) {
+      const fb = await pickFirstCatalogVariation();
+      if (!fb) return res.status(200).json({ success: false, error: 'No line items provided' });
+      items = [fb];
+      usedFallback = true;
     }
 
-    // Square line items
-    const lineItems = lineReq.map(it => ({
-      quantity: String(it.quantity || '1'),
-      catalogObjectId: it.variationId,
+    const lineItems = items.map(i => ({
+      quantity: i.quantity || '1',
+      catalogObjectId: i.variationId,
     }));
 
     const { result } = await client.ordersApi.createOrder({
       order: {
         locationId: LOCATION_ID,
         lineItems,
-        // Optional: attach a note for quick tracing during demos
-        note: req.body?.notes || (fallbackUsed ? 'Auto-filled first catalog item' : undefined),
+        note: req.body?.notes || (usedFallback ? 'Auto-filled first catalog item' : undefined),
       },
     });
 
-    const orderId = result?.order?.id || null;
-    if (!orderId) {
-      console.error('createOrder missing orderId:', result);
-      return res.status(200).json({ success: false, error: 'Order creation failed' });
-    }
+    const orderId = result?.order?.id;
+    if (!orderId) return res.status(200).json({ success: false, error: 'Order creation failed' });
 
-    return res.status(200).json({
+    res.status(200).json({
       success: true,
       orderId,
-      message: fallbackUsed ? 'No items passed; used first catalog item.' : 'Order created.',
+      message: usedFallback ? 'No items passed; used first catalog item.' : 'Order created.'
     });
   } catch (err) {
     console.error('create-order error:', err);
     const msg = err?.errors?.[0]?.detail || err.message || 'Unknown error';
-    return res.status(200).json({ success: false, error: msg });
+    res.status(200).json({ success: false, error: msg });
   }
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`✅ Server listening on :${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server on :${PORT}`));
