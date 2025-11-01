@@ -1,14 +1,16 @@
 {
-  "name": "vapi-square-order-backend",
+  "name": "vapi-square-backend",
   "version": "1.0.0",
   "main": "server.js",
+  "license": "MIT",
   "type": "module",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "square": "^37.0.0"
+  },
   "scripts": {
     "start": "node server.js"
-  },
-  "dependencies": {
-    "express": "4.19.2",
-    "cors": "2.8.5",
-    "square": "35.0.0"
   }
 }
