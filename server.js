@@ -1,97 +1,106 @@
 const express = require("express");
 const cors = require("cors");
-const { Client } = require("square"); // ✅ new SDK import (no Environment)
+const { SquareClient } = require("square");
 
-// --- Square Client ---
-const client = new Client({
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Square client setup
+const client = new SquareClient({
   accessToken: process.env.SQUARE_ACCESS_TOKEN,
-  environment: process.env.SQUARE_ENVIRONMENT, // "sandbox" or "production"
+  environment: process.env.SQUARE_ENVIRONMENT || "sandbox",
 });
 
 const catalogApi = client.catalogApi;
 const ordersApi = client.ordersApi;
 
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-// --- HEALTH CHECKS ---
+// Health checks
 app.get("/", (_req, res) => res.send("✅ API is running"));
 app.get("/health", (_req, res) =>
   res.json({ status: "ok", ts: new Date().toISOString() })
 );
 
-// --- GET MENU ITEMS ---
-app.get("/api/items", async (req, res) => {
+// =========================
+// 1) GET MENU ITEMS
+// =========================
+app.get("/api/items", async (_req, res) => {
   try {
-    const result = await catalogApi.listCatalog(undefined, "ITEM");
-    const objects = result?.result?.objects || [];
-    const items = objects.map((obj) => ({
+    const response = await catalogApi.listCatalog(undefined, "ITEM");
+    const items = (response.result.objects || []).map((obj) => ({
       id: obj.id,
       name: obj.itemData?.name,
-      price: obj.itemData?.variations?.[0]?.itemVariationData?.priceMoney?.amount || 0,
-      currency: obj.itemData?.variations?.[0]?.itemVariationData?.priceMoney?.currency || "USD",
+      price:
+        obj.itemData?.variations?.[0]?.itemVariationData?.priceMoney?.amount /
+          100 || 0,
     }));
 
-    return res.json({ success: true, items });
+    return res.status(200).json({ success: true, items });
   } catch (err) {
     console.error("🔥 Error fetching items:", err);
-    return res.status(200).json({ success: false, error: String(err) });
+    return res.status(200).json({
+      success: false,
+      items: [],
+      error: String(err?.message || err),
+    });
   }
 });
 
-// --- CREATE ORDER (VAPI TOOL ENDPOINT) ---
+// =========================
+// 2) CREATE ORDER
+// =========================
 app.post("/api/create-order", async (req, res) => {
   try {
-    console.log("📝 Received VAPI order payload:", req.body);
-
-    const { items_json, customer_name, customer_phone } = req.body;
+    const { items_json, customer_name, notes } = req.body || {};
     let items = [];
 
     try {
       items = Array.isArray(items_json)
         ? items_json
         : JSON.parse(items_json || "[]");
-    } catch (_e) {
+    } catch {
       items = [];
     }
 
-    if (items.length === 0) {
+    if (!items.length) {
       return res.status(200).json({
         success: false,
-        message: "No items provided.",
+        message: "No valid items passed",
       });
     }
 
     const lineItems = items.map((i) => ({
-      quantity: i.quantity?.toString() || "1",
+      quantity: String(i.quantity || 1),
       catalogObjectId: i.id,
     }));
 
-    const orderReq = {
+    const orderBody = {
       order: {
         locationId: process.env.SQUARE_LOCATION_ID,
         lineItems,
+        note: notes || undefined,
       },
     };
 
-    const orderResult = await ordersApi.createOrder(orderReq);
+    const orderResponse = await ordersApi.createOrder({ order: orderBody.order });
 
-    return res.json({
+    return res.status(200).json({
       success: true,
-      square_response: orderResult.result,
+      message: "✅ Order created!",
+      squareOrderId: orderResponse.result.order?.id,
+      debug: orderResponse.result,
     });
   } catch (err) {
-    console.error("🔥 Order creation error:", err);
+    console.error("🔥 Error creating order:", err);
     return res.status(200).json({
       success: false,
-      error: String(err),
+      message: "Order failed, check logs",
+      error: String(err?.message || err),
     });
   }
 });
 
-// --- START SERVER ---
+// Railway / Local server start
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
