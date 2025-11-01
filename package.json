@@ -1,17 +1,14 @@
 {
   "name": "vapi-square-order-backend",
   "version": "1.0.0",
-  "description": "Minimal backend for VAPI + Square integration.",
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": ">=18"
-  },
   "dependencies": {
-    "express": "^4.19.2",
+    "express": "^4.18.2",
     "cors": "^2.8.5",
-    "square": "*"
+    "square": "^36.2.0"
   }
 }
