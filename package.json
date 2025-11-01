@@ -1,16 +1,17 @@
 {
   "name": "vapi-square-order-backend",
   "version": "1.0.0",
+  "description": "Minimal backend for VAPI to read Square catalog and create orders (Sandbox or Production via env).",
   "main": "server.js",
-  "license": "MIT",
-  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "square": "^37.0.0",
-    "dotenv": "^16.4.5"
+    "square": "^36.1.0"
   }
 }
