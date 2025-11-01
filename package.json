@@ -2,13 +2,13 @@
   "name": "vapi-square-order-backend",
   "version": "1.0.0",
   "main": "server.js",
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
+    "express": "^4.19.2",
     "cors": "^2.8.5",
-    "square": "36.0.0"
+    "square": "^36.2.0"
   }
 }
