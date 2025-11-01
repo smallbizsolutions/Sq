@@ -1,113 +1,168 @@
-// server.js
-import express from "express";
-import cors from "cors";
-import bodyParser from "body-parser";
-import { Client, Environment } from "square";
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios');
+const { randomUUID } = require('crypto');
 
 const app = express();
 app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json());
 
-// ---- Square client ----
-const square = new Client({
-  accessToken: process.env.SQUARE_ACCESS_TOKEN,
-  environment: (process.env.SQUARE_ENVIRONMENT || "sandbox").toLowerCase() === "production"
-    ? Environment.Production
-    : Environment.Sandbox,
-});
+// ---- ENV ----
+const ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN;     // EAAA... (sandbox)
+const ENV = (process.env.SQUARE_ENVIRONMENT || 'sandbox').toLowerCase();
+const LOCATION_ID = process.env.SQUARE_LOCATION_ID;
 
-// Normalize catalog -> simple menu
-async function fetchMenuSimple() {
-  const { objectsApi } = square;
-  const out = [];
-  // Pull items
-  const itemsResp = await objectsApi.searchCatalogObjects({
-    objectTypes: ["ITEM"],
-    query: { prefixQuery: { attributeName: "name", prefix: "" } }
-  });
-
-  const items = itemsResp.result.objects || [];
-  for (const it of items) {
-    const name = it.itemData?.name?.trim();
-    const variations = it.itemData?.variations || [];
-    if (!name || variations.length === 0) continue;
-
-    // take first variation’s price if present
-    const v0 = variations[0];
-    const priceMoney = v0.itemVariationData?.priceMoney?.amount;
-    const price = (typeof priceMoney === "number") ? (priceMoney / 100).toFixed(2) : undefined;
-
-    out.push({ name, price });
-  }
-
-  // fallback if nothing
-  if (out.length === 0) {
-    return [
-      { name: "Burger", price: "4.99" },
-      { name: "Fries",  price: "1.99" },
-      { name: "Soda",   price: "0.99" },
-    ];
-  }
-  return out;
+if (!ACCESS_TOKEN || !LOCATION_ID) {
+  console.warn('Missing SQUARE_ACCESS_TOKEN or SQUARE_LOCATION_ID env vars.');
 }
 
-// ---- Unified endpoint ----
-app.post("/api/create-order", async (req, res) => {
+const BASE = ENV === 'production'
+  ? 'https://connect.squareup.com'
+  : 'https://connect.squareupsandbox.com';
+
+const authHeaders = {
+  Authorization: `Bearer ${ACCESS_TOKEN}`,
+  'Content-Type': 'application/json'
+};
+
+// ---- HELPERS ----
+async function fetchCatalogItems() {
+  // Pull only ITEM objects; variations (with prices) are nested under each item
+  const url = `${BASE}/v2/catalog/list`;
+  const res = await axios.get(url, {
+    headers: authHeaders,
+    params: { types: 'ITEM' }
+  });
+
+  const objects = res.data.objects || [];
+  const out = [];
+
+  for (const obj of objects) {
+    const itemId = obj.id;
+    const itemData = obj.item_data || {};
+    const name = itemData.name;
+
+    const variations = itemData.variations || [];
+    if (!variations.length) continue;
+
+    // Prefer the first variation for price
+    for (const v of variations) {
+      const varId = v.id;
+      const varData = v.item_variation_data || {};
+      const priceMoney = varData.price_money || {};
+      const priceCents = Number(priceMoney.amount || 0);
+
+      out.push({
+        itemId,
+        name,
+        variationId: varId,
+        priceCents,
+        price: (priceCents / 100).toFixed(2)
+      });
+      // if you only want one entry per name, break after first variation
+      break;
+    }
+  }
+
+  // De-dupe by name (keep first)
+  const seen = new Set();
+  const deduped = [];
+  for (const it of out) {
+    if (seen.has(it.name)) continue;
+    seen.add(it.name);
+    deduped.push(it);
+  }
+  return deduped;
+}
+
+// ---- ROUTES ----
+
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, env: ENV });
+});
+
+app.get('/api/items', async (_req, res) => {
   try {
-    const action = (req.body?.action || "create").toLowerCase();
+    const items = await fetchCatalogItems();
+    res.json({ success: true, items });
+  } catch (err) {
+    console.error('items error:', err?.response?.data || err.message);
+    res.status(500).json({ success: false, error: 'Failed to fetch items' });
+  }
+});
 
-    // 1) MENU
-    if (action === "menu") {
-      const menu = await fetchMenuSimple();
-      return res.json({ success: true, menu });
-    }
+app.post('/api/create-order', async (req, res) => {
+  try {
+    const {
+      items_json = '[]',
+      notes = '',
+      customer_name = '',
+      customer_phone = '',
+      customer_email = ''
+    } = req.body || {};
 
-    // 2) CREATE ORDER
-    const itemsJson = req.body?.items_json;
-    if (!itemsJson || itemsJson.trim().length === 0) {
-      return res.json({ success: false, error: "No line items provided" });
-    }
-
-    const notes = req.body?.notes || "";
-    const customer_name = req.body?.customer_name || "";
-    const customer_phone = req.body?.customer_phone || "";
-    const customer_email = req.body?.customer_email || "";
-
-    let parsed;
+    let cart = [];
     try {
-      parsed = JSON.parse(itemsJson);
+      cart = JSON.parse(items_json); // [{name, quantity}]
     } catch {
-      return res.json({ success: false, error: "items_json must be a JSON string" });
+      return res.status(400).json({ success: false, error: 'items_json must be a JSON string' });
     }
 
-    // Build order request (very simple: one line item per entry)
-    const lineItems = [];
-    for (const { name, quantity } of parsed) {
-      if (!name) continue;
-      const qty = String(quantity ?? 1);
-      lineItems.push({ name, quantity: qty });
-    }
-    if (lineItems.length === 0) {
-      return res.json({ success: false, error: "No valid items" });
+    if (!Array.isArray(cart) || cart.length === 0) {
+      // Allow empty: we’ll fall back to first catalog item so your Vapi test still works
+      const items = await fetchCatalogItems();
+      if (!items.length) return res.status(400).json({ success: false, error: 'No catalog items available' });
+      cart = [{ name: items[0].name, quantity: 1 }];
     }
 
-    // If you want a real Square order, map names->catalogObjectIds here.
-    // For demo, we just echo back a fake orderId.
-    const orderId = Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+    // Build price map from catalog (name -> priceCents)
+    const catalog = await fetchCatalogItems();
+    const priceMap = new Map(catalog.map(i => [i.name.toLowerCase(), i.priceCents]));
 
+    // Build Square line items
+    const lineItems = cart.map(row => {
+      const qty = String(row.quantity || 1);
+      const key = String(row.name || '').toLowerCase();
+      const priceCents = priceMap.get(key) || 0;
+
+      return {
+        name: row.name,
+        quantity: qty,
+        base_price_money: { amount: priceCents, currency: 'USD' }
+      };
+    });
+
+    const orderBody = {
+      idempotency_key: randomUUID(),
+      order: {
+        location_id: LOCATION_ID,
+        line_items: lineItems,
+        reference_id: customer_phone || undefined,
+        customer_id: undefined,
+        fulfillments: undefined,
+        ticket_name: customer_name || undefined,
+        note: notes || undefined
+      }
+    };
+
+    const createUrl = `${BASE}/v2/orders`;
+    const resp = await axios.post(createUrl, orderBody, { headers: authHeaders });
+
+    const orderId = resp?.data?.order?.id || null;
     return res.json({
       success: true,
       orderId,
-      message: "Order placed",
-      echo: { notes, customer_name, customer_phone, customer_email, lineItems }
+      message: orderId ? 'Order created' : 'Order created (no id returned)'
     });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ success: false, error: "Server error" });
+  } catch (err) {
+    console.error('create-order error:', err?.response?.data || err.message);
+    const msg = err?.response?.data?.errors?.[0]?.detail || 'Order creation failed';
+    res.status(500).json({ success: false, error: msg });
   }
 });
 
-// Health
-app.get("/", (_, res) => res.send("ok"));
-const port = process.env.PORT || 8080;
-app.listen(port, () => console.log("server on :" + port));
+// ---- START ----
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`Server listening on ${PORT} (${ENV})`);
+});
