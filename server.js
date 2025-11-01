@@ -1,4 +1,4 @@
-// server.js — Square sandbox order API for Vapi (name or variationId)
+// server.js — STRICT Square ordering (no unknown items allowed)
 const express = require('express');
 const cors = require('cors');
 const { Client, Environment } = require('square');
@@ -7,7 +7,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
-// ---- ENV ----
+// --- ENV ---
 const ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN;
 const LOCATION_ID  = process.env.SQUARE_LOCATION_ID;
 const ENVIRONMENT  = (process.env.SQUARE_ENVIRONMENT || 'sandbox').toLowerCase();
@@ -17,113 +17,135 @@ const client = new Client({
   environment: ENVIRONMENT === 'production' ? Environment.Production : Environment.Sandbox,
 });
 
-// ---- HELPERS ----
-const parseIncomingItems = (body) => {
-  // Accept many shapes: items_json (string/array), items, line_items
-  let src = body.items ?? body.line_items ?? body.items_json;
-  if (typeof src === 'string') { try { src = JSON.parse(src); } catch { /* ignore */ } }
-  if (!Array.isArray(src)) return [];
-  return src.map(i => ({
-    // allow variationId OR name
-    variationId: i.variationId || i.catalogObjectId || i.id || null,
-    name: i.name || i.itemName || null,
-    quantity: String(i.quantity ?? 1),
-  }));
+// ---------- helpers ----------
+const safeParse = (v) => {
+  if (!v) return null;
+  if (Array.isArray(v)) return v;
+  if (typeof v === 'string') try { return JSON.parse(v); } catch { return null; }
+  return null;
 };
 
-const resolveNamesToVariations = async (items) => {
-  // For any item with a name but no variationId, search catalog by text and pick first variation
-  const needLookup = items.filter(i => !i.variationId && i.name);
-  for (const it of needLookup) {
-    try {
-      const { result } = await client.catalogApi.searchCatalogObjects({
-        objectTypes: ['ITEM'],
-        query: { textFilter: it.name }
-      });
-      const found = (result?.objects || []).find(o =>
-        o.itemData?.name?.toLowerCase() === it.name.toLowerCase()
-      ) || (result?.objects || [])[0];
-
-      const v = found?.itemData?.variations?.[0];
-      if (v?.id) it.variationId = v.id;
-    } catch { /* keep going */ }
-  }
-  return items.filter(i => i.variationId); // drop anything unresolved
-};
-
-const pickFirstCatalogVariation = async () => {
+const loadCatalogIndex = async () => {
   const { result } = await client.catalogApi.listCatalog(undefined, 'ITEM');
-  const items = (result.objects || [])
-    .filter(o => o.type === 'ITEM' && o.itemData?.variations?.length);
-  if (!items.length) return null;
-  return { variationId: items[0].itemData.variations[0].id, quantity: '1' };
+  const nameToVariation = new Map();
+  const itemsOut = [];
+
+  for (const obj of result.objects || []) {
+    const item = obj.itemData;
+    if (!item?.variations?.length) continue;
+    const v = item.variations[0];
+    const priceCents = v.itemVariationData?.priceMoney?.amount ?? null;
+
+    nameToVariation.set(item.name.toLowerCase(), {
+      variationId: v.id,
+      priceCents
+    });
+
+    itemsOut.push({
+      itemId: obj.id,
+      name: item.name,
+      variationId: v.id,
+      priceCents,
+      price: priceCents != null ? (priceCents / 100).toFixed(2) : null
+    });
+  }
+
+  const allowedNames = itemsOut.map(i => i.name).sort((a,b)=>a.localeCompare(b));
+  return { nameToVariation, itemsOut, allowedNames };
 };
 
-// ---- ROUTES ----
+const toQty = (q) => {
+  const n = Number(q ?? 1);
+  return Number.isFinite(n) && n > 0 ? String(Math.floor(n)) : '1';
+};
+
+// ---------- routes ----------
 app.get('/', (req, res) => res.json({ ok: true, env: ENVIRONMENT }));
 
-app.get('/api/items', async (req, res) => {
+// keep your simple viewer
+app.get('/api/items', async (_req, res) => {
   try {
-    const { result } = await client.catalogApi.listCatalog(undefined, 'ITEM');
-    const out = [];
-    for (const obj of result.objects || []) {
-      const item = obj.itemData;
-      if (!item?.variations?.length) continue;
-      const v = item.variations[0];
-      const priceCents = v.itemVariationData?.priceMoney?.amount ?? null;
-      out.push({
-        itemId: obj.id,
-        name: item.name,
-        variationId: v.id,
-        priceCents,
-        price: priceCents != null ? (priceCents / 100).toFixed(2) : null,
-      });
-    }
-    res.json({ success: true, items: out });
-  } catch (err) {
-    console.error('items error:', err);
+    const { itemsOut } = await loadCatalogIndex();
+    res.json({ success: true, items: itemsOut });
+  } catch (e) {
+    console.error('items error:', e);
     res.status(200).json({ success: false, error: 'Failed to fetch items' });
   }
 });
 
-app.post('/api/create-order', async (req, res) => {
+// single endpoint with two actions to minimize tools in Vapi
+app.post('/api/order', async (req, res) => {
   try {
-    let items = parseIncomingItems(req.body);
-    if (items.length) items = await resolveNamesToVariations(items);
+    const action = (req.body?.action || '').toLowerCase();
 
-    let usedFallback = false;
-    if (!items.length) {
-      const fb = await pickFirstCatalogVariation();
-      if (!fb) return res.status(200).json({ success: false, error: 'No line items provided' });
-      items = [fb];
-      usedFallback = true;
+    // ---- MENU MODE ----
+    if (action === 'menu') {
+      const { itemsOut, allowedNames } = await loadCatalogIndex();
+      return res.status(200).json({ success: true, menu: itemsOut, allowedNames });
     }
 
-    const lineItems = items.map(i => ({
-      quantity: i.quantity || '1',
-      catalogObjectId: i.variationId,
-    }));
+    // ---- CREATE MODE ----
+    if (action !== 'create') {
+      return res.status(400).json({ success: false, error: 'Missing or invalid action. Use "menu" or "create".' });
+    }
+
+    // read items
+    let items = safeParse(req.body.items_json) || safeParse(req.body.items) || safeParse(req.body.line_items);
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(200).json({ success: false, error: 'No line items provided' });
+    }
+
+    // build catalog index
+    const { nameToVariation, allowedNames } = await loadCatalogIndex();
+
+    // validate & map
+    const unknown = [];
+    const lineItems = [];
+    for (const i of items) {
+      const name = (i.name || '').trim();
+      const qty  = toQty(i.quantity);
+      if (!name) { unknown.push('(blank)'); continue; }
+
+      const hit = nameToVariation.get(name.toLowerCase());
+      if (!hit) { unknown.push(name); continue; }
+
+      lineItems.push({
+        quantity: qty,
+        catalogObjectId: hit.variationId
+      });
+    }
+
+    if (unknown.length) {
+      return res.status(200).json({
+        success: false,
+        error: `Unknown items: ${unknown.join(', ')}`,
+        allowedNames
+      });
+    }
 
     const { result } = await client.ordersApi.createOrder({
       order: {
         locationId: LOCATION_ID,
         lineItems,
-        note: req.body?.notes || (usedFallback ? 'Auto-filled first catalog item' : undefined),
-      },
+        note: req.body?.notes || undefined
+      }
     });
 
     const orderId = result?.order?.id;
-    if (!orderId) return res.status(200).json({ success: false, error: 'Order creation failed' });
+    if (!orderId) {
+      return res.status(200).json({ success: false, error: 'Order creation failed' });
+    }
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       orderId,
-      message: usedFallback ? 'No items passed; used first catalog item.' : 'Order created.'
+      message: 'Order created'
     });
+
   } catch (err) {
-    console.error('create-order error:', err);
+    console.error('order error:', err);
     const msg = err?.errors?.[0]?.detail || err.message || 'Unknown error';
-    res.status(200).json({ success: false, error: msg });
+    return res.status(200).json({ success: false, error: msg });
   }
 });
 
