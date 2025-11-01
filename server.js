@@ -1,7 +1,6 @@
 import express from "express";
 import cors from "cors";
 
-/** --------- ENV --------- */
 const {
   SQUARE_ACCESS_TOKEN,
   SQUARE_LOCATION_ID,
@@ -9,7 +8,7 @@ const {
 } = process.env;
 
 if (!SQUARE_ACCESS_TOKEN || !SQUARE_LOCATION_ID) {
-  console.error("Missing SQUARE_ACCESS_TOKEN or SQUARE_LOCATION_ID env vars.");
+  console.error("❌ Missing SQUARE_ACCESS_TOKEN or SQUARE_LOCATION_ID");
 }
 
 const BASE =
@@ -17,14 +16,13 @@ const BASE =
     ? "https://connect.squareup.com"
     : "https://connect.squareupsandbox.com";
 
-/** --------- APP --------- */
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-/** Small helper to call Square REST */
 async function sq(path, init = {}) {
-  const res = await fetch(`${BASE}${path}`, {
+  const url = `${BASE}${path}`;
+  const res = await fetch(url, {
     ...init,
     headers: {
       Authorization: `Bearer ${SQUARE_ACCESS_TOKEN}`,
@@ -32,7 +30,9 @@ async function sq(path, init = {}) {
       ...(init.headers || {})
     }
   });
-  const data = await res.json().catch(() => ({}));
+  const text = await res.text();
+  let data;
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
   if (!res.ok) {
     const msg = data?.errors?.map(e => e.detail).join("; ") || res.statusText;
     throw new Error(`Square ${res.status} ${path} – ${msg}`);
@@ -40,82 +40,60 @@ async function sq(path, init = {}) {
   return data;
 }
 
-/** Health */
 app.get("/", (_, r) =>
   r.json({ ok: true, env: SQUARE_ENVIRONMENT, location: SQUARE_LOCATION_ID })
 );
 
-/** Get menu (ITEMs with first variation + price) */
+// --- MENU: return items with first-priced variation ---
 app.get("/api/items", async (req, res) => {
   try {
     const out = [];
-    let cursor = undefined;
-
+    let cursor;
     do {
       const q = new URLSearchParams({ types: "ITEM", ...(cursor && { cursor }) });
       const data = await sq(`/v2/catalog/list?${q.toString()}`);
       cursor = data.cursor;
-
       (data.objects || []).forEach(obj => {
         const item = obj.item_data;
         if (!item) return;
-
-        // Find first sellable variation with a price
-        const variations = (item.variations || [])
+        const priced = (item.variations || [])
           .map(v => ({
             variationId: v.id,
             priceCents: v.item_variation_data?.price_money?.amount ?? null
           }))
           .filter(v => v.priceCents !== null);
-
-        if (variations.length === 0) return;
-
-        const first = variations[0];
+        if (!priced.length) return;
+        const v0 = priced[0];
         out.push({
           itemId: obj.id,
           name: item.name,
-          variationId: first.variationId,
-          priceCents: first.priceCents,
-          price: (first.priceCents / 100).toFixed(2)
+          variationId: v0.variationId,
+          priceCents: v0.priceCents,
+          price: (v0.priceCents / 100).toFixed(2)
         });
       });
     } while (cursor);
-
-    // Optional: keep it predictable
     out.sort((a, b) => a.name.localeCompare(b.name));
     res.json({ success: true, items: out });
-  } catch (err) {
-    res.status(500).json({ success: false, error: String(err.message || err) });
+  } catch (e) {
+    res.status(500).json({ success: false, error: String(e.message || e) });
   }
 });
 
-/** Create order
- * Body:
- * {
- *   items_json: stringified array of { name?: string, variationId?: string, quantity: number }
- *   customer_name?: string
- *   customer_email?: string
- *   customer_phone?: string
- *   notes?: string
- * }
- */
+// --- CREATE ORDER ---
 app.post("/api/create-order", async (req, res) => {
+  const t0 = Date.now();
   try {
     let { items_json, customer_name, customer_email, customer_phone, notes } = req.body || {};
-    if (!items_json) {
-      return res.status(400).json({ success: false, error: "items_json required" });
-    }
+    if (!items_json) return res.status(400).json({ success: false, error: "items_json required" });
 
-    // Parse incoming items
     let items = items_json;
     if (typeof items_json === "string") items = JSON.parse(items_json);
-
-    if (!Array.isArray(items) || items.length === 0) {
+    if (!Array.isArray(items) || items.length === 0)
       return res.status(400).json({ success: false, error: "No line items provided" });
-    }
 
-    // Make sure we have variationIds. If only names were provided, map them.
-    const needLookup = items.some(it => !it.variationId);
+    // Map names -> variationId if needed
+    const needLookup = items.some(i => !i.variationId);
     let menuByName = {};
     if (needLookup) {
       const menuResp = await (await fetch(`${req.protocol}://${req.get("host")}/api/items`)).json();
@@ -126,23 +104,19 @@ app.post("/api/create-order", async (req, res) => {
     for (const it of items) {
       const qty = String(Math.max(1, parseInt(it.quantity || 1, 10)));
       let variationId = it.variationId;
-
       if (!variationId && it.name) {
         const hit = menuByName[it.name.toLowerCase()];
         if (hit) variationId = hit.variationId;
       }
       if (!variationId) {
-        return res.status(400).json({
-          success: false,
-          error: `Unknown item: ${it.name || "(no name)"}`
-        });
+        console.log("❌ Unknown item in request:", it);
+        return res.status(400).json({ success: false, error: `Unknown item: ${it.name || "(no name)"}` });
       }
       line_items.push({ quantity: qty, catalog_object_id: variationId });
     }
 
     const idempotency_key = `ord_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-
-    const body = {
+    const payload = {
       idempotency_key,
       order: {
         location_id: SQUARE_LOCATION_ID,
@@ -151,23 +125,19 @@ app.post("/api/create-order", async (req, res) => {
       }
     };
 
-    const created = await sq(`/v2/orders`, {
-      method: "POST",
-      body: JSON.stringify(body)
-    });
-
+    console.log("➡️  POST /v2/orders", JSON.stringify(payload));
+    const created = await sq(`/v2/orders`, { method: "POST", body: JSON.stringify(payload) });
     const orderId = created?.order?.id || null;
-    res.json({
-      success: true,
-      orderId,
-      message: orderId ? "Order created." : "Order created (no id returned)."
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, error: String(err.message || err) });
+    console.log("✅ Square order created:", orderId, "in", Date.now() - t0, "ms");
+
+    res.json({ success: true, orderId, message: "Order created." });
+  } catch (e) {
+    console.log("❌ Create-order failed:", e?.message || e);
+    res.status(500).json({ success: false, error: String(e.message || e) });
   }
 });
 
-/** Quick viewer for recent orders (helps you verify without hunting around UI) */
+// --- RECENT ORDERS VIEW ---
 app.get("/api/orders", async (req, res) => {
   try {
     const data = await sq(`/v2/orders/search`, {
@@ -179,8 +149,33 @@ app.get("/api/orders", async (req, res) => {
       })
     });
     res.json({ success: true, orders: data?.orders || [] });
-  } catch (err) {
-    res.status(500).json({ success: false, error: String(err.message || err) });
+  } catch (e) {
+    res.status(500).json({ success: false, error: String(e.message || e) });
+  }
+});
+
+// --- ONE-CLICK SANDBOX TEST (creates 1 order using first menu item) ---
+app.post("/api/debug/sample-order", async (req, res) => {
+  try {
+    const menu = await (await fetch(`${req.protocol}://${req.get("host")}/api/items`)).json();
+    const first = (menu.items || [])[0];
+    if (!first) return res.status(400).json({ success: false, error: "No priced items in catalog" });
+
+    const body = {
+      items_json: JSON.stringify([{ variationId: first.variationId, quantity: 1 }]),
+      customer_name: "Sandbox Tester",
+      customer_phone: "000-000-0000",
+      notes: "debug sample"
+    };
+    const r = await fetch(`${req.protocol}://${req.get("host")}/api/create-order`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const data = await r.json();
+    res.status(r.status).json({ fromDebug: true, ...data });
+  } catch (e) {
+    res.status(500).json({ success: false, error: String(e.message || e) });
   }
 });
 
