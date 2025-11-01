@@ -1,15 +1,17 @@
 {
   "name": "vapi-square-order-backend",
   "version": "1.0.0",
-  "type": "commonjs",
-  "private": true,
+  "main": "server.js",
+  "license": "MIT",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
+    "axios": "^1.7.2",
     "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "square": "36.0.0"
+    "express": "^4.19.2"
   }
 }
