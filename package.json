@@ -9,6 +9,6 @@
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
-    "square": "^36.2.0"
+    "square": "36.0.0"
   }
 }
