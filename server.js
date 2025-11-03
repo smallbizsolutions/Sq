@@ -8,7 +8,7 @@ app.use(express.json({ limit: '1mb' }));
 
 const PORT = process.env.PORT || 3000;
 
-// ---- Env & Square base (supports SQUARE_ENV or SQUARE_ENVIRONMENT) ----
+// ---- Env & Square base ----
 const ENV = (process.env.SQUARE_ENV || process.env.SQUARE_ENVIRONMENT || 'sandbox').toLowerCase();
 const BASE = ENV === 'production'
   ? 'https://connect.squareup.com'
@@ -16,6 +16,7 @@ const BASE = ENV === 'production'
 
 const ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN || '';
 const LOCATION_ID  = process.env.SQUARE_LOCATION_ID  || '';
+const APP_ID       = process.env.SQUARE_APPLICATION_ID || ''; // NEW: optional but helpful in Dashboard
 const INBOUND_KEY  = process.env.INBOUND_API_KEY || process.env.VAPI_INBOUND_KEY || '';
 
 const SQ_HEADERS = {
@@ -51,7 +52,7 @@ app.get('/selfcheck', async (_req, res) => {
   }
 });
 
-// ---- Inbound gate: require Authorization: Bearer <INBOUND_API_KEY> ----
+// ---- Inbound gate ----
 app.use((req, res, next) => {
   const auth = req.get('authorization') || '';
   const bearer = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7) : '';
@@ -62,7 +63,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- Synonyms (expand per client if needed) ----
+// ---- Synonyms ----
 const SYNONYMS = [
   { test: /^cheeseburger$/i, base: 'Burger', addMods: ['add cheese'] },
   { test: /^hamburger$/i,    base: 'Burger', addMods: [] },
@@ -76,7 +77,7 @@ function applySynonym(name) {
   return null;
 }
 
-// ---- Catalog cache (ITEM, VARIATION, MODIFIER_LIST, MODIFIER) with pagination ----
+// ---- Catalog cache (ITEM, VARIATION, MODIFIER_LIST, MODIFIER) ----
 const TTL = 300_000; // 5 minutes
 let cache = { at: 0, items: null, itemAllowedMods: null, refreshing: null };
 
@@ -101,8 +102,8 @@ async function fetchCatalog() {
     const itemsById = new Map();
     const itemNameById = new Map();
     const variations = [];
-    const modifierLists = new Map();     // listId -> { name, modifiers: [{id,name}] }
-    const modifiersByList = new Map();   // listId -> [{id,name}]
+    const modifierLists = new Map();
+    const modifiersByList = new Map();
 
     for (const o of objs) {
       if (o.type === 'ITEM') {
@@ -127,9 +128,8 @@ async function fetchCatalog() {
       if (modifierLists.has(listId)) modifierLists.get(listId).modifiers = mods;
     }
 
-    // Build items for menu and allowed modifier map per item
     const itemsOut = [];
-    const itemAllowedMods = new Map(); // itemId -> Map(nameLower or baseWord -> modId)
+    const itemAllowedMods = new Map(); // itemId -> Map(keyword -> modId)
 
     for (const v of variations) {
       const vd = v.item_variation_data || {};
@@ -141,14 +141,13 @@ async function fetchCatalog() {
 
       itemsOut.push({
         itemId,
-        name: baseName,                 // e.g., "Soda"
+        name: baseName,
         variationId: v.id,
         priceCents: cents,
         price: (cents / 100).toFixed(2),
-        label: `${baseName} - ${varName}` // e.g., "Soda - Large"
+        label: `${baseName} - ${varName}`
       });
 
-      // Allowed modifiers for this item
       const item = itemsById.get(itemId);
       const listInfo = item?.item_data?.modifier_list_info || [];
       const modMap = itemAllowedMods.get(itemId) || new Map();
@@ -159,7 +158,7 @@ async function fetchCatalog() {
         for (const m of list.modifiers) {
           const n = norm(m.name);
           modMap.set(n, m.id);
-          modMap.set(baseWord(n), m.id); // also match base word (“cheese” matches “extra cheese”)
+          modMap.set(baseWord(n), m.id);
         }
       }
       if (modMap.size) itemAllowedMods.set(itemId, modMap);
@@ -173,51 +172,40 @@ async function fetchCatalog() {
   return cache.refreshing;
 }
 
-// Resolve a variation by exact label, base name, or hint
 function resolveVariation(nameOrLabel, menu, hint) {
   const q = norm(nameOrLabel);
-
-  // exact label
   let hit = menu.find(m => norm(m.label) === q);
   if (hit) return hit;
-
-  // exact base name (first variation)
   hit = menu.find(m => norm(m.name) === q);
   if (hit) return hit;
-
-  // hint-based contains (for “coke”, “sprite”, etc.)
   if (hint) {
     const h = norm(hint);
     hit = menu.find(m => norm(m.label).includes(h) || norm(m.name).includes(h));
     if (hit) return hit;
   }
-
-  // fallback contains on label (prefers “Regular” if present)
   hit = menu.find(m => norm(m.label) === `${q} - regular`) ||
         menu.find(m => norm(m.label).startsWith(`${q} -`)) ||
         menu.find(m => norm(m.label).includes(q));
   return hit || null;
 }
 
-// ---- GET /api/items (list menu variants) ----
+// ---- GET /api/items ----
 async function getMenuHandler(_req, res) {
   try {
     if (!configOk()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
     const { items } = await fetchCatalog();
     res.json({ success: true, items });
   } catch (e) {
-    console.error('[items]', e);
     res.status(500).json({ success: false, error: String(e) });
   }
 }
 app.get('/api/items', getMenuHandler);
 
-// ---- POST /api/create-order (pickup, unpaid) ----
+// ---- POST /api/create-order ----
 async function createOrderHandler(req, res) {
   try {
     if (!configOk()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
 
-    // Parse items_json as array
     let items = req.body.items_json;
     if (typeof items === 'string') { try { items = JSON.parse(items); } catch { items = []; } }
     if (!Array.isArray(items) || items.length === 0)
@@ -236,33 +224,28 @@ async function createOrderHandler(req, res) {
     const line_items = [];
     for (const it of items) {
       const qty = String(it.quantity ?? 1);
-
-      // Apply synonyms (e.g., cheeseburger -> Burger + add cheese)
       let reqName = it.name || it.label || '';
       let extraMods = [];
       let hint = undefined;
       const syn = applySynonym(reqName);
       if (syn) { reqName = syn.base; extraMods = syn.addMods || []; hint = syn.hint; }
 
-      // Choose variation
       let chosen = null;
       if (it.variationId) {
         chosen = byId.get(it.variationId) || null;
       } else if (reqName) {
-        // If caller provided explicit variation text (e.g., "Large"), try exact "Name - Variation"
         if (it.variation) {
           const tryLabel = `${reqName} - ${it.variation}`;
           chosen = menu.find(m => norm(m.label) === norm(tryLabel)) || null;
         }
         chosen = chosen || resolveVariation(reqName, menu, hint);
-        if (!chosen) { // try base fallback
+        if (!chosen) {
           const b = byBase.get(norm(reqName));
           if (b) chosen = b;
         }
       }
-      if (!chosen) continue; // skip unknown item
+      if (!chosen) continue;
 
-      // Modifiers
       const allowed = itemAllowedMods.get(chosen.itemId) || new Map();
       const modsIn = [
         ...(Array.isArray(it.modifiers) ? it.modifiers : []),
@@ -273,19 +256,20 @@ async function createOrderHandler(req, res) {
 
       for (const raw of modsIn) {
         const s = norm(String(raw));
-        // “no/without X” -> don’t add a modifier; keep it in the note
-        if (/^(no|without)\s+/.test(s)) {
+        if (/^(no|without)\s+/.test(s)) { // keep “no onion” in note
           note = note ? `${note}; ${raw}` : String(raw);
           continue;
         }
-        // “extra/add/light X” -> try to map to a modifier id
         const base = baseWord(s);
         const id = allowed.get(s) || allowed.get(base);
         if (id) modsOut.push({ catalog_object_id: id, quantity: '1' });
         else note = note ? `${note}; ${raw}` : String(raw);
       }
 
-      const li = { catalog_object_id: chosen.variationId, quantity: qty };
+      const li = {
+        catalog_object_id: chosen.variationId,
+        quantity: qty,
+      };
       if (modsOut.length) li.modifiers = modsOut;
       if (note) li.note = note;
 
@@ -295,17 +279,13 @@ async function createOrderHandler(req, res) {
     if (!line_items.length)
       return res.status(400).json({ success: false, error: 'No valid line_items matched the catalog' });
 
-    // --- Make it show up in Dashboard Orders ---
-    const whenISO = pickup_at
-      ? new Date(pickup_at).toISOString()
-      : new Date(Date.now() + 20 * 60 * 1000).toISOString();
-
+    // Make it "accepted" so it shows under Active in Order Manager
     const fulfillment = {
       type: 'PICKUP',
-      state: 'RESERVED',                 // visible to Order Manager
+      state: 'RESERVED', // CHANGED from PROPOSED
       pickup_details: {
-        schedule_type: 'SCHEDULED',      // always schedule
-        pickup_at: whenISO,
+        schedule_type: pickup_at ? 'SCHEDULED' : 'ASAP',
+        pickup_at: pickup_at || undefined,
         recipient: {
           display_name: customer_name,
           phone_number: customer_phone
@@ -318,12 +298,15 @@ async function createOrderHandler(req, res) {
       idempotency_key: crypto.randomUUID(),
       order: {
         location_id: LOCATION_ID,
-        state: 'OPEN',                   // ensure Dashboard treats it as active
         line_items,
         fulfillments: [fulfillment],
         note: order_notes,
         reference_id: customer_phone || undefined,
-        source: { name: 'Phone Assistant' }
+        source: {
+          name: 'Phone Assistant',
+          // Including application_id helps Dashboard show a proper Order Source filter
+          application_id: APP_ID || undefined
+        }
       }
     };
 
@@ -338,7 +321,13 @@ async function createOrderHandler(req, res) {
       return res.status(r.status).json({ success: false, error: json });
     }
 
-    res.json({ success: true, orderId: json.order?.id || null });
+    const o = json.order || {};
+    res.json({
+      success: true,
+      orderId: o.id || null,
+      locationId: o.location_id || null,
+      fulfillmentState: o.fulfillments?.[0]?.state || null
+    });
   } catch (e) {
     console.error('[create-order] error', e);
     res.status(500).json({ success: false, error: String(e) });
@@ -346,7 +335,44 @@ async function createOrderHandler(req, res) {
 }
 app.post('/api/create-order', createOrderHandler);
 
-// ---- Route aliases to match your VAPI tool names (use either path) ----
+// ---- Quick debug: search orders created today for this location ----
+app.get('/api/search-today', async (_req, res) => {
+  try {
+    if (!configOk()) return res.status(500).json({ ok: false, error: 'Square credentials not configured' });
+    // last 24h window
+    const now = new Date();
+    const start = new Date(now.getTime() - 24*60*60*1000).toISOString();
+    const body = {
+      location_ids: [LOCATION_ID],
+      query: {
+        filter: {
+          date_time_filter: { created_at: { start_at: start, end_at: now.toISOString() } }
+        }
+      },
+      limit: 10
+    };
+    const r = await fetch(`${BASE}/v2/orders/search`, {
+      method: 'POST',
+      headers: SQ_HEADERS,
+      body: JSON.stringify(body)
+    });
+    const j = await r.json();
+    if (!r.ok) return res.status(r.status).json(j);
+    const out = (j.orders || []).map(o => ({
+      id: o.id,
+      state: o.state,
+      source: o.source?.name || null,
+      fulfillment: o.fulfillments?.[0]?.state || null,
+      created_at: o.created_at
+    }));
+    res.json({ ok: true, count: out.length, orders: out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
+
+// ---- Route aliases ----
+app.get('/api/items', getMenuHandler);
 app.get('/square/getMenu', (req, res) => getMenuHandler(req, res));
 app.post('/square/createOrder', (req, res) => createOrderHandler(req, res));
 
