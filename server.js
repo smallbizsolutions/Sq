@@ -1,9 +1,5 @@
-// server.js — Node 18+, ESM. Final "house" build for Square pickup orders via VAPI.
-// Endpoints used by VAPI tools:
-//   GET  /api/items           -> getMenu()
-//   POST /api/create-order    -> createOrder(order_object)
-// Optional debug:
-//   GET  /api/orders/latest   -> recent orders (to prove they exist)
+// server.js — Node 18+, ESM. Square pickup orders with natural-language summary.
+// FINAL: warms catalog, builds human confirmation ("one single burger"), no default ETA.
 
 import express from 'express';
 import crypto from 'crypto';
@@ -31,7 +27,7 @@ const SQ_HEADERS = {
   'Authorization': `Bearer ${ACCESS_TOKEN}`,
 };
 
-const okConfig = () => Boolean(ACCESS_TOKEN && LOCATION_ID);
+const okCfg = () => !!(ACCESS_TOKEN && LOCATION_ID);
 const norm = (s='') => String(s).toLowerCase().trim();
 const baseWord = (s='') => norm(s).replace(/^(extra|add|light|no|without|with)\s+/, '');
 
@@ -42,27 +38,32 @@ app.get('/healthz', (_req, res) => res.json({
   hasLocation: !!LOCATION_ID
 }));
 
+// Self-check that calls Square and confirms location exists
 app.get('/selfcheck', async (_req, res) => {
   try {
-    if (!okConfig()) return res.status(500).json({ ok: false, error: 'Square credentials not configured' });
+    if (!okCfg()) return res.status(500).json({ ok: false, error: 'Square credentials not configured' });
     const r = await fetch(`${BASE}/v2/locations`, { headers: SQ_HEADERS });
     const j = await r.json();
     if (!r.ok) return res.status(r.status).json({ ok: false, error: j });
     const loc = (j.locations || []).find(l => l.id === LOCATION_ID);
     res.json({ ok: !!loc, locationName: loc?.name || null, env: ENV });
-  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
 });
 
-// ---- Inbound gate (require Authorization: Bearer <INBOUND_API_KEY>) ----
+// ---- Inbound gate ----
 app.use((req, res, next) => {
   const auth = req.get('authorization') || '';
   const bearer = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7) : '';
   const key = bearer || req.get('x-inbound-api-key') || req.get('x-api-key');
-  if (!INBOUND_KEY || key !== INBOUND_KEY) return res.status(401).json({ success: false, error: 'unauthorized' });
+  if (!INBOUND_KEY || key !== INBOUND_KEY) {
+    return res.status(401).json({ success: false, error: 'unauthorized' });
+  }
   next();
 });
 
-// ---- Synonyms (expand per client if wanted) ----
+// ---- Synonyms ----
 const SYNONYMS = [
   { test: /^cheeseburger$/i, base: 'Burger', addMods: ['add cheese'] },
   { test: /^hamburger$/i,    base: 'Burger', addMods: [] },
@@ -70,19 +71,19 @@ const SYNONYMS = [
   { test: /^coke$/i,         base: 'Soda',   addMods: [], hint: 'coke' },
   { test: /^sprite$/i,       base: 'Soda',   addMods: [], hint: 'sprite' },
 ];
-const applySyn = (name) => {
+const applySynonym = (name) => {
   const n = String(name || '').trim();
   for (const s of SYNONYMS) if (s.test.test(n)) return s;
   return null;
 };
 
 // ---- Catalog cache (ITEM, VARIATION, MODIFIER_LIST, MODIFIER) ----
-const TTL = 300_000; // 5 min
-let cache = { at: 0, items: null, itemAllowedMods: null, refreshing: null };
+const TTL = 300_000; // 5 minutes
+let cache = { at: 0, items: null, itemAllowedMods: null, modIdToName: null, refreshing: null };
 
 async function fetchCatalog() {
   const now = Date.now();
-  if (cache.items && cache.itemAllowedMods && now - cache.at < TTL) return cache;
+  if (cache.items && cache.itemAllowedMods && cache.modIdToName && now - cache.at < TTL) return cache;
   if (cache.refreshing) return cache.refreshing;
 
   cache.refreshing = (async () => {
@@ -92,10 +93,10 @@ async function fetchCatalog() {
       const url = `${BASE}/v2/catalog/list?types=ITEM,ITEM_VARIATION,MODIFIER_LIST,MODIFIER` +
                   (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
       const r = await fetch(url, { headers: SQ_HEADERS });
-      const j = await r.json();
-      if (!r.ok) throw new Error(`catalog list ${r.status}: ${JSON.stringify(j)}`);
-      if (j.objects?.length) objs.push(...j.objects);
-      cursor = j.cursor || null;
+      const json = await r.json();
+      if (!r.ok) throw new Error(`catalog list ${r.status}: ${JSON.stringify(json)}`);
+      if (json.objects?.length) objs.push(...json.objects);
+      cursor = json.cursor || null;
     } while (cursor);
 
     const itemsById = new Map();
@@ -103,6 +104,7 @@ async function fetchCatalog() {
     const variations = [];
     const modifierLists = new Map();
     const modifiersByList = new Map();
+    const modIdToName = new Map();
 
     for (const o of objs) {
       if (o.type === 'ITEM') {
@@ -118,9 +120,11 @@ async function fetchCatalog() {
       if (o.type === 'MODIFIER') {
         const listId = o.modifier_data?.modifier_list_id;
         if (!listId) continue;
+        const m = { id: o.id, name: o.modifier_data?.name || '' };
         const arr = modifiersByList.get(listId) || [];
-        arr.push({ id: o.id, name: o.modifier_data?.name || '' });
+        arr.push(m);
         modifiersByList.set(listId, arr);
+        modIdToName.set(m.id, m.name);
       }
     }
     for (const [listId, mods] of modifiersByList) {
@@ -128,7 +132,7 @@ async function fetchCatalog() {
     }
 
     const itemsOut = [];
-    const itemAllowedMods = new Map(); // itemId -> Map(keyword -> modId)
+    const itemAllowedMods = new Map(); // itemId -> Map(keyword -> {id,name})
 
     for (const v of variations) {
       const vd = v.item_variation_data || {};
@@ -140,14 +144,13 @@ async function fetchCatalog() {
 
       itemsOut.push({
         itemId,
-        name: baseName,                     // e.g., "Soda"
-        variationId: v.id,                  // var id
+        name: baseName,
+        variationId: v.id,
         priceCents: cents,
         price: (cents / 100).toFixed(2),
-        label: `${baseName} - ${varName}`   // e.g., "Soda - Large"
+        label: `${baseName} - ${varName}`
       });
 
-      // Allowed modifiers for this item
       const item = itemsById.get(itemId);
       const listInfo = item?.item_data?.modifier_list_info || [];
       const modMap = itemAllowedMods.get(itemId) || new Map();
@@ -157,51 +160,45 @@ async function fetchCatalog() {
         if (!list) continue;
         for (const m of list.modifiers) {
           const n = norm(m.name);
-          modMap.set(n, m.id);
-          modMap.set(baseWord(n), m.id); // "cheese" matches "extra cheese"
+          const val = { id: m.id, name: m.name };
+          modMap.set(n, val);
+          modMap.set(baseWord(n), val);
         }
       }
       if (modMap.size) itemAllowedMods.set(itemId, modMap);
     }
 
     itemsOut.sort((a, b) => a.label.localeCompare(b.label));
-    cache = { at: Date.now(), items: itemsOut, itemAllowedMods, refreshing: null };
+    cache = { at: Date.now(), items: itemsOut, itemAllowedMods, modIdToName, refreshing: null };
     return cache;
   })();
 
   return cache.refreshing;
 }
 
-function resolveVariation(nameOrLabel, menu, hint) {
-  const q = norm(nameOrLabel);
+// ---- Helpers for natural language summary ----
+const NUM_WORD = ['zero','one','two','three','four','five','six','seven','eight','nine','ten'];
+const toWord = (n) => (n>=0 && n<=10) ? NUM_WORD[n] : String(n);
 
-  // exact label
-  let hit = menu.find(m => norm(m.label) === q);
-  if (hit) return hit;
-
-  // exact base name (first variation)
-  hit = menu.find(m => norm(m.name) === q);
-  if (hit) return hit;
-
-  // hint-based contains (e.g., "coke", "sprite")
-  if (hint) {
-    const h = norm(hint);
-    hit = menu.find(m => norm(m.label).includes(h) || norm(m.name).includes(h));
-    if (hit) return hit;
-  }
-
-  // fallback contains on label (prefers "Regular")
-  hit = menu.find(m => norm(m.label) === `${q} - regular`) ||
-        menu.find(m => norm(m.label).startsWith(`${q} -`)) ||
-        menu.find(m => norm(m.label).includes(q));
-  return hit || null;
+function varToFront(label) {
+  // "Burger - Single" -> "single burger"
+  // "Soda - Medium"  -> "medium soda"
+  const [base, v] = String(label).split(' - ');
+  if (!v) return base;
+  return `${norm(v).replace(/\bregular\b/,'regular')} ${norm(base)}`.replace(/\s+/g,' ').trim();
+}
+function joinList(arr) {
+  if (!arr.length) return '';
+  if (arr.length === 1) return arr[0];
+  return `${arr.slice(0,-1).join(', ')} and ${arr[arr.length-1]}`;
 }
 
 // ---- GET /api/items ----
 async function getMenuHandler(_req, res) {
   try {
-    if (!okConfig()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
+    if (!okCfg()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
     const { items } = await fetchCatalog();
+    // Only return neutral data; no “default toppings” nonsense.
     res.json({ success: true, items });
   } catch (e) {
     res.status(500).json({ success: false, error: String(e) });
@@ -212,9 +209,8 @@ app.get('/api/items', getMenuHandler);
 // ---- POST /api/create-order ----
 async function createOrderHandler(req, res) {
   try {
-    if (!okConfig()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
+    if (!okCfg()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
 
-    // items_json can be JSON string or array
     let items = req.body.items_json;
     if (typeof items === 'string') { try { items = JSON.parse(items); } catch { items = []; } }
     if (!Array.isArray(items) || items.length === 0)
@@ -225,89 +221,92 @@ async function createOrderHandler(req, res) {
     const order_notes    = req.body.notes || undefined;
     const pickup_at      = req.body.pickup_at || undefined;
 
-    const { items: menu, itemAllowedMods } = await fetchCatalog();
+    const { items: menu, itemAllowedMods, modIdToName } = await fetchCatalog();
     const byId   = new Map(menu.map(m => [m.variationId, m]));
-    const byBase = new Map();
-    for (const m of menu) if (!byBase.has(norm(m.name))) byBase.set(norm(m.name), m);
 
     const line_items = [];
-    for (const it of items) {
-      const qty = String(it.quantity ?? 1);
+    const speak_chunks = [];
 
-      // synonyms (e.g., cheeseburger -> Burger + add cheese)
+    for (const it of items) {
+      const qty = Number(it.quantity ?? 1);
       let reqName = it.name || it.label || '';
       let extraMods = [];
       let hint = undefined;
-      const syn = applySyn(reqName);
+      const syn = applySynonym(reqName);
       if (syn) { reqName = syn.base; extraMods = syn.addMods || []; hint = syn.hint; }
 
-      // pick variation
+      // Resolve variation
       let chosen = null;
       if (it.variationId) {
         chosen = byId.get(it.variationId) || null;
-      } else if (reqName) {
+      } else {
+        const q = norm(reqName);
+        // try explicit "Name - Variation"
         if (it.variation) {
           const tryLabel = `${reqName} - ${it.variation}`;
           chosen = menu.find(m => norm(m.label) === norm(tryLabel)) || null;
         }
-        chosen = chosen || resolveVariation(reqName, menu, hint);
-        if (!chosen) {
-          const b = byBase.get(norm(reqName));
-          if (b) chosen = b;
+        // fallback by includes
+        chosen = chosen || menu.find(m => norm(m.name) === q) || menu.find(m => norm(m.label).startsWith(`${q} -`)) || null;
+        if (!chosen && hint) {
+          chosen = menu.find(m => norm(m.label).includes(norm(hint))) || null;
         }
       }
       if (!chosen) continue;
 
-      // map modifiers
+      // Allowed modifiers for this item
       const allowed = itemAllowedMods.get(chosen.itemId) || new Map();
       const modsIn = [
         ...(Array.isArray(it.modifiers) ? it.modifiers : []),
         ...extraMods
       ];
       const modsOut = [];
+      const modNames = [];
+      const noNames = [];
       let note = it.note ? String(it.note) : '';
 
       for (const raw of modsIn) {
         const s = norm(String(raw));
-
-        // "no/without X" — Square usually needs explicit "no <modifier>" objects.
-        // To avoid bad mappings, we put removals into the note unless an explicit matching mod exists.
         if (/^(no|without)\s+/.test(s)) {
-          const base = baseWord(s);
-          const id = allowed.get(s) || allowed.get(base);
-          if (id) modsOut.push({ catalog_object_id: id, quantity: '1' });
-          else note = note ? `${note}; ${raw}` : String(raw);
+          // "no onions" -> keep for speech/note, don't add modifier
+          noNames.push(s.replace(/^(no|without)\s+/, '').trim());
+          note = note ? `${note}; ${raw}` : String(raw);
           continue;
         }
-
-        // "extra/add/light X"
-        const base = baseWord(s);
-        const id = allowed.get(s) || allowed.get(base);
-        if (id) modsOut.push({ catalog_object_id: id, quantity: '1' });
-        else note = note ? `${note}; ${raw}` : String(raw);
+        const key = baseWord(s);
+        const found = allowed.get(s) || allowed.get(key);
+        if (found) {
+          modsOut.push({ catalog_object_id: found.id, quantity: '1' });
+          modNames.push(found.name.toLowerCase());
+        } else {
+          // unknown mod -> shove to note
+          note = note ? `${note}; ${raw}` : String(raw);
+        }
       }
 
-      const li = { catalog_object_id: chosen.variationId, quantity: qty };
+      const li = { catalog_object_id: chosen.variationId, quantity: String(qty) };
       if (modsOut.length) li.modifiers = modsOut;
       if (note) li.note = note;
-
       line_items.push(li);
+
+      // Build human chunk: "one single burger with cheese, no onions"
+      const itemText = varToFront(chosen.label); // "single burger"
+      const qtyText = toWord(qty);
+      const withText = modNames.length ? ` with ${joinList(modNames)}` : '';
+      const noText   = noNames.length  ? (withText ? `, no ${joinList(noNames)}` : ` with no ${joinList(noNames)}`) : '';
+      speak_chunks.push(`${qtyText} ${itemText}${withText}${noText}`.replace(/\s+/g,' ').trim());
     }
 
     if (!line_items.length)
       return res.status(400).json({ success: false, error: 'No valid line_items matched the catalog' });
 
-    // pickup fulfillment
     const fulfillment = {
       type: 'PICKUP',
       state: 'PROPOSED',
       pickup_details: {
         schedule_type: pickup_at ? 'SCHEDULED' : 'ASAP',
         pickup_at: pickup_at || undefined,
-        recipient: {
-          display_name: customer_name,
-          phone_number: customer_phone
-        },
+        recipient: { display_name: customer_name, phone_number: customer_phone },
         note: order_notes
       }
     };
@@ -324,14 +323,25 @@ async function createOrderHandler(req, res) {
       }
     };
 
-    const r = await fetch(`${BASE}/v2/orders`, { method: 'POST', headers: SQ_HEADERS, body: JSON.stringify(payload) });
-    const j = await r.json();
+    const r = await fetch(`${BASE}/v2/orders`, {
+      method: 'POST',
+      headers: SQ_HEADERS,
+      body: JSON.stringify(payload)
+    });
+    const json = await r.json();
     if (!r.ok) {
-      console.error('[create-order] failed', r.status, j?.errors || j);
-      return res.status(r.status).json({ success: false, error: j });
+      console.error('[create-order] failed', r.status, json?.errors || json);
+      return res.status(r.status).json({ success: false, error: json });
     }
 
-    res.json({ success: true, orderId: j.order?.id || null });
+    // Natural-language confirmation for the voice agent to read verbatim.
+    const spoken = `You’re all set, ${customer_name}. ${joinList(speak_chunks)}. Thanks—see you soon.`;
+
+    res.json({
+      success: true,
+      orderId: json.order?.id || null,
+      summary_tts: spoken    // the assistant should speak this and then end the call.
+    });
   } catch (e) {
     console.error('[create-order] error', e);
     res.status(500).json({ success: false, error: String(e) });
@@ -339,35 +349,17 @@ async function createOrderHandler(req, res) {
 }
 app.post('/api/create-order', createOrderHandler);
 
-// ---- Optional: recent orders to prove they exist even if UI hides them ----
-app.get('/api/orders/latest', async (_req, res) => {
-  try {
-    if (!okConfig()) return res.status(500).json({ ok:false, error:'Square creds missing' });
-    const body = {
-      location_ids: [LOCATION_ID],
-      query: { filter: { date_time_filter: { created_at: { start_at: new Date(Date.now()-2*60*60*1000).toISOString() } } } },
-      limit: 10,
-      return_entries: false
-    };
-    const r = await fetch(`${BASE}/v2/orders/search`, { method: 'POST', headers: SQ_HEADERS, body: JSON.stringify(body) });
-    const j = await r.json();
-    if (!r.ok) return res.status(r.status).json(j);
-    const out = (j.orders || []).map(o => ({
-      id: o.id,
-      state: o.state,
-      created_at: o.created_at,
-      fulfillments: o.fulfillments?.map(f => ({ type: f.type, state: f.state, pickup_at: f.pickup_details?.pickup_at })),
-      line_items: o.line_items?.map(li => ({ qty: li.quantity, varId: li.catalog_object_id })),
-      source: o.source?.name
-    }));
-    res.json({ ok:true, orders: out });
-  } catch (e) { res.status(500).json({ ok:false, error:String(e) }); }
-});
-
-// ---- Aliases to match any older VAPI tool configs ----
+// ---- Route aliases ----
 app.get('/square/getMenu', (req, res) => getMenuHandler(req, res));
 app.post('/square/createOrder', (req, res) => createOrderHandler(req, res));
 
+// ---- Warm the catalog so first call isn't slow ----
+const WARM_INTERVAL_MS = 4 * 60 * 1000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server listening on ${PORT} (env=${ENV})`);
+  setTimeout(() => { fetchCatalog().catch(()=>{}); }, 0);
+  setInterval(() => { fetchCatalog().catch(()=>{}); }, WARM_INTERVAL_MS);
+});
+app.post('/warmup', (_req, res) => {
+  fetchCatalog().then(() => res.json({ok:true})).catch(e => res.status(500).json({ok:false, error:String(e)}));
 });
