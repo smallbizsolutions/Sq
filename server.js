@@ -1,4 +1,10 @@
-// server.js — Node 18+, ESM. Square pickup orders with variations + modifiers + synonyms.
+// server.js — Node 18+, ESM. Final "house" build for Square pickup orders via VAPI.
+// Endpoints used by VAPI tools:
+//   GET  /api/items           -> getMenu()
+//   POST /api/create-order    -> createOrder(order_object)
+// Optional debug:
+//   GET  /api/orders/latest   -> recent orders (to prove they exist)
+
 import express from 'express';
 import crypto from 'crypto';
 
@@ -25,44 +31,38 @@ const SQ_HEADERS = {
   'Authorization': `Bearer ${ACCESS_TOKEN}`,
 };
 
-function configOk() { return !!(ACCESS_TOKEN && LOCATION_ID); }
+const okConfig = () => Boolean(ACCESS_TOKEN && LOCATION_ID);
 const norm = (s='') => String(s).toLowerCase().trim();
 const baseWord = (s='') => norm(s).replace(/^(extra|add|light|no|without|with)\s+/, '');
 
 // ---- Health ----
 app.get('/healthz', (_req, res) => res.json({
-  ok: true,
-  env: ENV,
+  ok: true, env: ENV,
   hasAccessToken: !!ACCESS_TOKEN,
-  hasLocation: !!(LOCATION_ID && LOCATION_ID.length > 0),
+  hasLocation: !!LOCATION_ID
 }));
 
-// Self-check that calls Square and confirms location exists
 app.get('/selfcheck', async (_req, res) => {
   try {
-    if (!configOk()) return res.status(500).json({ ok: false, error: 'Square credentials not configured' });
+    if (!okConfig()) return res.status(500).json({ ok: false, error: 'Square credentials not configured' });
     const r = await fetch(`${BASE}/v2/locations`, { headers: SQ_HEADERS });
     const j = await r.json();
     if (!r.ok) return res.status(r.status).json({ ok: false, error: j });
     const loc = (j.locations || []).find(l => l.id === LOCATION_ID);
     res.json({ ok: !!loc, locationName: loc?.name || null, env: ENV });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
+  } catch (e) { res.status(500).json({ ok: false, error: String(e) }); }
 });
 
-// ---- Inbound gate ----
+// ---- Inbound gate (require Authorization: Bearer <INBOUND_API_KEY>) ----
 app.use((req, res, next) => {
   const auth = req.get('authorization') || '';
   const bearer = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7) : '';
   const key = bearer || req.get('x-inbound-api-key') || req.get('x-api-key');
-  if (!INBOUND_KEY || key !== INBOUND_KEY) {
-    return res.status(401).json({ success: false, error: 'unauthorized' });
-  }
+  if (!INBOUND_KEY || key !== INBOUND_KEY) return res.status(401).json({ success: false, error: 'unauthorized' });
   next();
 });
 
-// ---- Synonyms ----
+// ---- Synonyms (expand per client if wanted) ----
 const SYNONYMS = [
   { test: /^cheeseburger$/i, base: 'Burger', addMods: ['add cheese'] },
   { test: /^hamburger$/i,    base: 'Burger', addMods: [] },
@@ -70,14 +70,14 @@ const SYNONYMS = [
   { test: /^coke$/i,         base: 'Soda',   addMods: [], hint: 'coke' },
   { test: /^sprite$/i,       base: 'Soda',   addMods: [], hint: 'sprite' },
 ];
-function applySynonym(name) {
+const applySyn = (name) => {
   const n = String(name || '').trim();
   for (const s of SYNONYMS) if (s.test.test(n)) return s;
   return null;
-}
+};
 
 // ---- Catalog cache (ITEM, VARIATION, MODIFIER_LIST, MODIFIER) ----
-const TTL = 300_000; // 5 minutes
+const TTL = 300_000; // 5 min
 let cache = { at: 0, items: null, itemAllowedMods: null, refreshing: null };
 
 async function fetchCatalog() {
@@ -92,10 +92,10 @@ async function fetchCatalog() {
       const url = `${BASE}/v2/catalog/list?types=ITEM,ITEM_VARIATION,MODIFIER_LIST,MODIFIER` +
                   (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
       const r = await fetch(url, { headers: SQ_HEADERS });
-      const json = await r.json();
-      if (!r.ok) throw new Error(`catalog list ${r.status}: ${JSON.stringify(json)}`);
-      if (json.objects?.length) objs.push(...json.objects);
-      cursor = json.cursor || null;
+      const j = await r.json();
+      if (!r.ok) throw new Error(`catalog list ${r.status}: ${JSON.stringify(j)}`);
+      if (j.objects?.length) objs.push(...j.objects);
+      cursor = j.cursor || null;
     } while (cursor);
 
     const itemsById = new Map();
@@ -140,13 +140,14 @@ async function fetchCatalog() {
 
       itemsOut.push({
         itemId,
-        name: baseName,
-        variationId: v.id,
+        name: baseName,                     // e.g., "Soda"
+        variationId: v.id,                  // var id
         priceCents: cents,
         price: (cents / 100).toFixed(2),
-        label: `${baseName} - ${varName}`
+        label: `${baseName} - ${varName}`   // e.g., "Soda - Large"
       });
 
+      // Allowed modifiers for this item
       const item = itemsById.get(itemId);
       const listInfo = item?.item_data?.modifier_list_info || [];
       const modMap = itemAllowedMods.get(itemId) || new Map();
@@ -157,7 +158,7 @@ async function fetchCatalog() {
         for (const m of list.modifiers) {
           const n = norm(m.name);
           modMap.set(n, m.id);
-          modMap.set(baseWord(n), m.id);
+          modMap.set(baseWord(n), m.id); // "cheese" matches "extra cheese"
         }
       }
       if (modMap.size) itemAllowedMods.set(itemId, modMap);
@@ -173,15 +174,23 @@ async function fetchCatalog() {
 
 function resolveVariation(nameOrLabel, menu, hint) {
   const q = norm(nameOrLabel);
+
+  // exact label
   let hit = menu.find(m => norm(m.label) === q);
   if (hit) return hit;
+
+  // exact base name (first variation)
   hit = menu.find(m => norm(m.name) === q);
   if (hit) return hit;
+
+  // hint-based contains (e.g., "coke", "sprite")
   if (hint) {
     const h = norm(hint);
     hit = menu.find(m => norm(m.label).includes(h) || norm(m.name).includes(h));
     if (hit) return hit;
   }
+
+  // fallback contains on label (prefers "Regular")
   hit = menu.find(m => norm(m.label) === `${q} - regular`) ||
         menu.find(m => norm(m.label).startsWith(`${q} -`)) ||
         menu.find(m => norm(m.label).includes(q));
@@ -191,7 +200,7 @@ function resolveVariation(nameOrLabel, menu, hint) {
 // ---- GET /api/items ----
 async function getMenuHandler(_req, res) {
   try {
-    if (!configOk()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
+    if (!okConfig()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
     const { items } = await fetchCatalog();
     res.json({ success: true, items });
   } catch (e) {
@@ -203,8 +212,9 @@ app.get('/api/items', getMenuHandler);
 // ---- POST /api/create-order ----
 async function createOrderHandler(req, res) {
   try {
-    if (!configOk()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
+    if (!okConfig()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
 
+    // items_json can be JSON string or array
     let items = req.body.items_json;
     if (typeof items === 'string') { try { items = JSON.parse(items); } catch { items = []; } }
     if (!Array.isArray(items) || items.length === 0)
@@ -224,14 +234,14 @@ async function createOrderHandler(req, res) {
     for (const it of items) {
       const qty = String(it.quantity ?? 1);
 
-      // synonyms (cheeseburger→Burger + add cheese, etc.)
+      // synonyms (e.g., cheeseburger -> Burger + add cheese)
       let reqName = it.name || it.label || '';
       let extraMods = [];
       let hint = undefined;
-      const syn = applySynonym(reqName);
+      const syn = applySyn(reqName);
       if (syn) { reqName = syn.base; extraMods = syn.addMods || []; hint = syn.hint; }
 
-      // choose variation
+      // pick variation
       let chosen = null;
       if (it.variationId) {
         chosen = byId.get(it.variationId) || null;
@@ -240,11 +250,15 @@ async function createOrderHandler(req, res) {
           const tryLabel = `${reqName} - ${it.variation}`;
           chosen = menu.find(m => norm(m.label) === norm(tryLabel)) || null;
         }
-        chosen = chosen || resolveVariation(reqName, menu, hint) || byBase.get(norm(reqName)) || null;
+        chosen = chosen || resolveVariation(reqName, menu, hint);
+        if (!chosen) {
+          const b = byBase.get(norm(reqName));
+          if (b) chosen = b;
+        }
       }
       if (!chosen) continue;
 
-      // modifiers: map recognized ones; push unknowns to line note
+      // map modifiers
       const allowed = itemAllowedMods.get(chosen.itemId) || new Map();
       const modsIn = [
         ...(Array.isArray(it.modifiers) ? it.modifiers : []),
@@ -255,7 +269,18 @@ async function createOrderHandler(req, res) {
 
       for (const raw of modsIn) {
         const s = norm(String(raw));
-        if (/^(no|without)\s+/.test(s)) { note = note ? `${note}; ${raw}` : String(raw); continue; }
+
+        // "no/without X" — Square usually needs explicit "no <modifier>" objects.
+        // To avoid bad mappings, we put removals into the note unless an explicit matching mod exists.
+        if (/^(no|without)\s+/.test(s)) {
+          const base = baseWord(s);
+          const id = allowed.get(s) || allowed.get(base);
+          if (id) modsOut.push({ catalog_object_id: id, quantity: '1' });
+          else note = note ? `${note}; ${raw}` : String(raw);
+          continue;
+        }
+
+        // "extra/add/light X"
         const base = baseWord(s);
         const id = allowed.get(s) || allowed.get(base);
         if (id) modsOut.push({ catalog_object_id: id, quantity: '1' });
@@ -265,19 +290,24 @@ async function createOrderHandler(req, res) {
       const li = { catalog_object_id: chosen.variationId, quantity: qty };
       if (modsOut.length) li.modifiers = modsOut;
       if (note) li.note = note;
+
       line_items.push(li);
     }
 
     if (!line_items.length)
       return res.status(400).json({ success: false, error: 'No valid line_items matched the catalog' });
 
+    // pickup fulfillment
     const fulfillment = {
       type: 'PICKUP',
       state: 'PROPOSED',
       pickup_details: {
         schedule_type: pickup_at ? 'SCHEDULED' : 'ASAP',
         pickup_at: pickup_at || undefined,
-        recipient: { display_name: customer_name, phone_number: customer_phone },
+        recipient: {
+          display_name: customer_name,
+          phone_number: customer_phone
+        },
         note: order_notes
       }
     };
@@ -289,58 +319,54 @@ async function createOrderHandler(req, res) {
         line_items,
         fulfillments: [fulfillment],
         note: order_notes,
-        reference_id: customer_phone || undefined
+        reference_id: customer_phone || undefined,
+        source: { name: 'Phone Assistant' }
       }
     };
 
     const r = await fetch(`${BASE}/v2/orders`, { method: 'POST', headers: SQ_HEADERS, body: JSON.stringify(payload) });
-    const json = await r.json();
-    if (!r.ok) return res.status(r.status).json({ success: false, error: json });
+    const j = await r.json();
+    if (!r.ok) {
+      console.error('[create-order] failed', r.status, j?.errors || j);
+      return res.status(r.status).json({ success: false, error: j });
+    }
 
-    res.json({ success: true, orderId: json.order?.id || null, state: json.order?.state || 'UNKNOWN' });
+    res.json({ success: true, orderId: j.order?.id || null });
   } catch (e) {
+    console.error('[create-order] error', e);
     res.status(500).json({ success: false, error: String(e) });
   }
 }
 app.post('/api/create-order', createOrderHandler);
 
-// ---- SEARCH recent orders (debug/visibility) ----
-app.get('/api/search-orders', async (_req, res) => {
+// ---- Optional: recent orders to prove they exist even if UI hides them ----
+app.get('/api/orders/latest', async (_req, res) => {
   try {
-    if (!configOk()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
-
+    if (!okConfig()) return res.status(500).json({ ok:false, error:'Square creds missing' });
     const body = {
       location_ids: [LOCATION_ID],
-      query: {
-        sort: { sort_field: 'CREATED_AT', order: 'DESC' },
-        filter: { state_filter: { states: ['OPEN', 'COMPLETED', 'DRAFT', 'CANCELED'] } }
-      },
-      limit: 10
+      query: { filter: { date_time_filter: { created_at: { start_at: new Date(Date.now()-2*60*60*1000).toISOString() } } } },
+      limit: 10,
+      return_entries: false
     };
-
     const r = await fetch(`${BASE}/v2/orders/search`, { method: 'POST', headers: SQ_HEADERS, body: JSON.stringify(body) });
     const j = await r.json();
-    if (!r.ok) return res.status(r.status).json({ success: false, error: j });
-
-    const orders = (j.orders || []).map(o => ({
+    if (!r.ok) return res.status(r.status).json(j);
+    const out = (j.orders || []).map(o => ({
       id: o.id,
       state: o.state,
       created_at: o.created_at,
-      location_id: o.location_id,
-      fulfillments: (o.fulfillments || []).map(f => ({
-        type: f.type, state: f.state, pickup_at: f.pickup_details?.pickup_at
-      }))
+      fulfillments: o.fulfillments?.map(f => ({ type: f.type, state: f.state, pickup_at: f.pickup_details?.pickup_at })),
+      line_items: o.line_items?.map(li => ({ qty: li.quantity, varId: li.catalog_object_id })),
+      source: o.source?.name
     }));
-    res.json({ success: true, count: orders.length, orders });
-  } catch (e) {
-    res.status(500).json({ success: false, error: String(e) });
-  }
+    res.json({ ok:true, orders: out });
+  } catch (e) { res.status(500).json({ ok:false, error:String(e) }); }
 });
 
-// ---- Aliases ----
+// ---- Aliases to match any older VAPI tool configs ----
 app.get('/square/getMenu', (req, res) => getMenuHandler(req, res));
 app.post('/square/createOrder', (req, res) => createOrderHandler(req, res));
-app.get('/square/searchOrders', (req, res) => app._router.handle({ ...arguments[0], method: 'GET', url: '/api/search-orders' }, arguments[1]));
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server listening on ${PORT} (env=${ENV})`);
