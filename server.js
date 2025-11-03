@@ -25,9 +25,9 @@ const SQ_HEADERS = {
   'Authorization': `Bearer ${ACCESS_TOKEN}`,
 };
 
+function configOk() { return !!(ACCESS_TOKEN && LOCATION_ID); }
 const norm = (s='') => String(s).toLowerCase().trim();
 const baseWord = (s='') => norm(s).replace(/^(extra|add|light|no|without|with)\s+/, '');
-const configOk = () => !!(ACCESS_TOKEN && LOCATION_ID);
 
 // ---- Health ----
 app.get('/healthz', (_req, res) => res.json({
@@ -45,13 +45,13 @@ app.get('/selfcheck', async (_req, res) => {
     const j = await r.json();
     if (!r.ok) return res.status(r.status).json({ ok: false, error: j });
     const loc = (j.locations || []).find(l => l.id === LOCATION_ID);
-    res.json({ ok: !!loc, locationId: LOCATION_ID, locationName: loc?.name || null, env: ENV });
+    res.json({ ok: !!loc, locationName: loc?.name || null, env: ENV });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// ---- Inbound gate (require Authorization: Bearer <INBOUND_API_KEY> or x-inbound-api-key) ----
+// ---- Inbound gate ----
 app.use((req, res, next) => {
   const auth = req.get('authorization') || '';
   const bearer = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7) : '';
@@ -62,7 +62,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- Synonyms (expand per client if needed) ----
+// ---- Synonyms ----
 const SYNONYMS = [
   { test: /^cheeseburger$/i, base: 'Burger', addMods: ['add cheese'] },
   { test: /^hamburger$/i,    base: 'Burger', addMods: [] },
@@ -76,7 +76,7 @@ function applySynonym(name) {
   return null;
 }
 
-// ---- Catalog cache (ITEM, VARIATION, MODIFIER_LIST, MODIFIER) with pagination ----
+// ---- Catalog cache (ITEM, VARIATION, MODIFIER_LIST, MODIFIER) ----
 const TTL = 300_000; // 5 minutes
 let cache = { at: 0, items: null, itemAllowedMods: null, refreshing: null };
 
@@ -173,23 +173,15 @@ async function fetchCatalog() {
 
 function resolveVariation(nameOrLabel, menu, hint) {
   const q = norm(nameOrLabel);
-
-  // exact "Name - Variation"
   let hit = menu.find(m => norm(m.label) === q);
   if (hit) return hit;
-
-  // base name (first variation)
   hit = menu.find(m => norm(m.name) === q);
   if (hit) return hit;
-
-  // hint-based (e.g., "coke" -> Soda variation label contains coke)
   if (hint) {
     const h = norm(hint);
     hit = menu.find(m => norm(m.label).includes(h) || norm(m.name).includes(h));
     if (hit) return hit;
   }
-
-  // fallback contains
   hit = menu.find(m => norm(m.label) === `${q} - regular`) ||
         menu.find(m => norm(m.label).startsWith(`${q} -`)) ||
         menu.find(m => norm(m.label).includes(q));
@@ -213,8 +205,7 @@ async function createOrderHandler(req, res) {
   try {
     if (!configOk()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
 
-    // Accept either items_json (string or array) or items (array)
-    let items = req.body.items_json ?? req.body.items;
+    let items = req.body.items_json;
     if (typeof items === 'string') { try { items = JSON.parse(items); } catch { items = []; } }
     if (!Array.isArray(items) || items.length === 0)
       return res.status(400).json({ success: false, error: 'items_json must be a non-empty array' });
@@ -235,7 +226,6 @@ async function createOrderHandler(req, res) {
       let reqName = it.name || it.label || '';
       let extraMods = [];
       let hint = undefined;
-
       const syn = applySynonym(reqName);
       if (syn) { reqName = syn.base; extraMods = syn.addMods || []; hint = syn.hint; }
 
@@ -255,7 +245,6 @@ async function createOrderHandler(req, res) {
       }
       if (!chosen) continue;
 
-      // Map modifiers. Negatives (no/without) -> put into note, don't try to map.
       const allowed = itemAllowedMods.get(chosen.itemId) || new Map();
       const modsIn = [
         ...(Array.isArray(it.modifiers) ? it.modifiers : []),
@@ -266,17 +255,22 @@ async function createOrderHandler(req, res) {
 
       for (const raw of modsIn) {
         const s = norm(String(raw));
-        if (/^(no|without)\s+/.test(s)) { // keep as human note
+        // "no/without X" -> keep in note (don't fabricate a modifier)
+        if (/^(no|without)\s+/.test(s)) {
           note = note ? `${note}; ${raw}` : String(raw);
           continue;
         }
+        // "extra/add/light X" -> try to map to a modifier id
         const base = baseWord(s);
         const id = allowed.get(s) || allowed.get(base);
         if (id) modsOut.push({ catalog_object_id: id, quantity: '1' });
         else note = note ? `${note}; ${raw}` : String(raw);
       }
 
-      const li = { catalog_object_id: chosen.variationId, quantity: qty };
+      const li = {
+        catalog_object_id: chosen.variationId,
+        quantity: qty,
+      };
       if (modsOut.length) li.modifiers = modsOut;
       if (note) li.note = note;
 
@@ -303,12 +297,13 @@ async function createOrderHandler(req, res) {
     const payload = {
       idempotency_key: crypto.randomUUID(),
       order: {
+        state: 'OPEN',                 // <-- ensure visible in Dashboard
         location_id: LOCATION_ID,
-        source: { name: 'Phone Assistant' }, // shows up as an order source in Dashboard
         line_items,
         fulfillments: [fulfillment],
         note: order_notes,
-        reference_id: customer_phone || undefined
+        reference_id: customer_phone || undefined,
+        source: { name: 'Phone Assistant' }
       }
     };
 
@@ -331,7 +326,8 @@ async function createOrderHandler(req, res) {
 }
 app.post('/api/create-order', createOrderHandler);
 
-// ---- Route aliases (use either path from VAPI tools) ----
+// ---- Route aliases ----
+app.get('/api/items', getMenuHandler);
 app.get('/square/getMenu', (req, res) => getMenuHandler(req, res));
 app.post('/square/createOrder', (req, res) => createOrderHandler(req, res));
 
