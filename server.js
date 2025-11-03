@@ -16,7 +16,6 @@ const BASE = ENV === 'production'
 
 const ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN || '';
 const LOCATION_ID  = process.env.SQUARE_LOCATION_ID  || '';
-const APP_ID       = process.env.SQUARE_APPLICATION_ID || ''; // NEW: optional but helpful in Dashboard
 const INBOUND_KEY  = process.env.INBOUND_API_KEY || process.env.VAPI_INBOUND_KEY || '';
 
 const SQ_HEADERS = {
@@ -224,12 +223,15 @@ async function createOrderHandler(req, res) {
     const line_items = [];
     for (const it of items) {
       const qty = String(it.quantity ?? 1);
+
+      // synonyms (cheeseburger→Burger + add cheese, etc.)
       let reqName = it.name || it.label || '';
       let extraMods = [];
       let hint = undefined;
       const syn = applySynonym(reqName);
       if (syn) { reqName = syn.base; extraMods = syn.addMods || []; hint = syn.hint; }
 
+      // choose variation
       let chosen = null;
       if (it.variationId) {
         chosen = byId.get(it.variationId) || null;
@@ -238,14 +240,11 @@ async function createOrderHandler(req, res) {
           const tryLabel = `${reqName} - ${it.variation}`;
           chosen = menu.find(m => norm(m.label) === norm(tryLabel)) || null;
         }
-        chosen = chosen || resolveVariation(reqName, menu, hint);
-        if (!chosen) {
-          const b = byBase.get(norm(reqName));
-          if (b) chosen = b;
-        }
+        chosen = chosen || resolveVariation(reqName, menu, hint) || byBase.get(norm(reqName)) || null;
       }
       if (!chosen) continue;
 
+      // modifiers: map recognized ones; push unknowns to line note
       const allowed = itemAllowedMods.get(chosen.itemId) || new Map();
       const modsIn = [
         ...(Array.isArray(it.modifiers) ? it.modifiers : []),
@@ -256,40 +255,29 @@ async function createOrderHandler(req, res) {
 
       for (const raw of modsIn) {
         const s = norm(String(raw));
-        if (/^(no|without)\s+/.test(s)) { // keep “no onion” in note
-          note = note ? `${note}; ${raw}` : String(raw);
-          continue;
-        }
+        if (/^(no|without)\s+/.test(s)) { note = note ? `${note}; ${raw}` : String(raw); continue; }
         const base = baseWord(s);
         const id = allowed.get(s) || allowed.get(base);
         if (id) modsOut.push({ catalog_object_id: id, quantity: '1' });
         else note = note ? `${note}; ${raw}` : String(raw);
       }
 
-      const li = {
-        catalog_object_id: chosen.variationId,
-        quantity: qty,
-      };
+      const li = { catalog_object_id: chosen.variationId, quantity: qty };
       if (modsOut.length) li.modifiers = modsOut;
       if (note) li.note = note;
-
       line_items.push(li);
     }
 
     if (!line_items.length)
       return res.status(400).json({ success: false, error: 'No valid line_items matched the catalog' });
 
-    // Make it "accepted" so it shows under Active in Order Manager
     const fulfillment = {
       type: 'PICKUP',
-      state: 'RESERVED', // CHANGED from PROPOSED
+      state: 'PROPOSED',
       pickup_details: {
         schedule_type: pickup_at ? 'SCHEDULED' : 'ASAP',
         pickup_at: pickup_at || undefined,
-        recipient: {
-          display_name: customer_name,
-          phone_number: customer_phone
-        },
+        recipient: { display_name: customer_name, phone_number: customer_phone },
         note: order_notes
       }
     };
@@ -301,80 +289,58 @@ async function createOrderHandler(req, res) {
         line_items,
         fulfillments: [fulfillment],
         note: order_notes,
-        reference_id: customer_phone || undefined,
-        source: {
-          name: 'Phone Assistant',
-          // Including application_id helps Dashboard show a proper Order Source filter
-          application_id: APP_ID || undefined
-        }
+        reference_id: customer_phone || undefined
       }
     };
 
-    const r = await fetch(`${BASE}/v2/orders`, {
-      method: 'POST',
-      headers: SQ_HEADERS,
-      body: JSON.stringify(payload)
-    });
+    const r = await fetch(`${BASE}/v2/orders`, { method: 'POST', headers: SQ_HEADERS, body: JSON.stringify(payload) });
     const json = await r.json();
-    if (!r.ok) {
-      console.error('[create-order] failed', r.status, json?.errors || json);
-      return res.status(r.status).json({ success: false, error: json });
-    }
+    if (!r.ok) return res.status(r.status).json({ success: false, error: json });
 
-    const o = json.order || {};
-    res.json({
-      success: true,
-      orderId: o.id || null,
-      locationId: o.location_id || null,
-      fulfillmentState: o.fulfillments?.[0]?.state || null
-    });
+    res.json({ success: true, orderId: json.order?.id || null, state: json.order?.state || 'UNKNOWN' });
   } catch (e) {
-    console.error('[create-order] error', e);
     res.status(500).json({ success: false, error: String(e) });
   }
 }
 app.post('/api/create-order', createOrderHandler);
 
-// ---- Quick debug: search orders created today for this location ----
-app.get('/api/search-today', async (_req, res) => {
+// ---- SEARCH recent orders (debug/visibility) ----
+app.get('/api/search-orders', async (_req, res) => {
   try {
-    if (!configOk()) return res.status(500).json({ ok: false, error: 'Square credentials not configured' });
-    // last 24h window
-    const now = new Date();
-    const start = new Date(now.getTime() - 24*60*60*1000).toISOString();
+    if (!configOk()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
+
     const body = {
       location_ids: [LOCATION_ID],
       query: {
-        filter: {
-          date_time_filter: { created_at: { start_at: start, end_at: now.toISOString() } }
-        }
+        sort: { sort_field: 'CREATED_AT', order: 'DESC' },
+        filter: { state_filter: { states: ['OPEN', 'COMPLETED', 'DRAFT', 'CANCELED'] } }
       },
       limit: 10
     };
-    const r = await fetch(`${BASE}/v2/orders/search`, {
-      method: 'POST',
-      headers: SQ_HEADERS,
-      body: JSON.stringify(body)
-    });
+
+    const r = await fetch(`${BASE}/v2/orders/search`, { method: 'POST', headers: SQ_HEADERS, body: JSON.stringify(body) });
     const j = await r.json();
-    if (!r.ok) return res.status(r.status).json(j);
-    const out = (j.orders || []).map(o => ({
+    if (!r.ok) return res.status(r.status).json({ success: false, error: j });
+
+    const orders = (j.orders || []).map(o => ({
       id: o.id,
       state: o.state,
-      source: o.source?.name || null,
-      fulfillment: o.fulfillments?.[0]?.state || null,
-      created_at: o.created_at
+      created_at: o.created_at,
+      location_id: o.location_id,
+      fulfillments: (o.fulfillments || []).map(f => ({
+        type: f.type, state: f.state, pickup_at: f.pickup_details?.pickup_at
+      }))
     }));
-    res.json({ ok: true, count: out.length, orders: out });
+    res.json({ success: true, count: orders.length, orders });
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    res.status(500).json({ success: false, error: String(e) });
   }
 });
 
-// ---- Route aliases ----
-app.get('/api/items', getMenuHandler);
+// ---- Aliases ----
 app.get('/square/getMenu', (req, res) => getMenuHandler(req, res));
 app.post('/square/createOrder', (req, res) => createOrderHandler(req, res));
+app.get('/square/searchOrders', (req, res) => app._router.handle({ ...arguments[0], method: 'GET', url: '/api/search-orders' }, arguments[1]));
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server listening on ${PORT} (env=${ENV})`);
