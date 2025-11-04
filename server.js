@@ -1,5 +1,4 @@
 // server.js — Node 18+, ESM. Square pickup orders with natural-language summary.
-// FINAL: warms catalog, builds human confirmation ("one single burger"), no default ETA.
 
 import express from 'express';
 import crypto from 'crypto';
@@ -181,8 +180,6 @@ const NUM_WORD = ['zero','one','two','three','four','five','six','seven','eight'
 const toWord = (n) => (n>=0 && n<=10) ? NUM_WORD[n] : String(n);
 
 function varToFront(label) {
-  // "Burger - Single" -> "single burger"
-  // "Soda - Medium"  -> "medium soda"
   const [base, v] = String(label).split(' - ');
   if (!v) return base;
   return `${norm(v).replace(/\bregular\b/,'regular')} ${norm(base)}`.replace(/\s+/g,' ').trim();
@@ -198,7 +195,6 @@ async function getMenuHandler(_req, res) {
   try {
     if (!okCfg()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
     const { items } = await fetchCatalog();
-    // Only return neutral data; no “default toppings” nonsense.
     res.json({ success: true, items });
   } catch (e) {
     res.status(500).json({ success: false, error: String(e) });
@@ -221,7 +217,7 @@ async function createOrderHandler(req, res) {
     const order_notes    = req.body.notes || undefined;
     const pickup_at      = req.body.pickup_at || undefined;
 
-    const { items: menu, itemAllowedMods, modIdToName } = await fetchCatalog();
+    const { items: menu, itemAllowedMods } = await fetchCatalog();
     const byId   = new Map(menu.map(m => [m.variationId, m]));
 
     const line_items = [];
@@ -235,18 +231,15 @@ async function createOrderHandler(req, res) {
       const syn = applySynonym(reqName);
       if (syn) { reqName = syn.base; extraMods = syn.addMods || []; hint = syn.hint; }
 
-      // Resolve variation
       let chosen = null;
       if (it.variationId) {
         chosen = byId.get(it.variationId) || null;
       } else {
         const q = norm(reqName);
-        // try explicit "Name - Variation"
         if (it.variation) {
           const tryLabel = `${reqName} - ${it.variation}`;
           chosen = menu.find(m => norm(m.label) === norm(tryLabel)) || null;
         }
-        // fallback by includes
         chosen = chosen || menu.find(m => norm(m.name) === q) || menu.find(m => norm(m.label).startsWith(`${q} -`)) || null;
         if (!chosen && hint) {
           chosen = menu.find(m => norm(m.label).includes(norm(hint))) || null;
@@ -254,7 +247,6 @@ async function createOrderHandler(req, res) {
       }
       if (!chosen) continue;
 
-      // Allowed modifiers for this item
       const allowed = itemAllowedMods.get(chosen.itemId) || new Map();
       const modsIn = [
         ...(Array.isArray(it.modifiers) ? it.modifiers : []),
@@ -268,7 +260,6 @@ async function createOrderHandler(req, res) {
       for (const raw of modsIn) {
         const s = norm(String(raw));
         if (/^(no|without)\s+/.test(s)) {
-          // "no onions" -> keep for speech/note, don't add modifier
           noNames.push(s.replace(/^(no|without)\s+/, '').trim());
           note = note ? `${note}; ${raw}` : String(raw);
           continue;
@@ -279,7 +270,6 @@ async function createOrderHandler(req, res) {
           modsOut.push({ catalog_object_id: found.id, quantity: '1' });
           modNames.push(found.name.toLowerCase());
         } else {
-          // unknown mod -> shove to note
           note = note ? `${note}; ${raw}` : String(raw);
         }
       }
@@ -289,8 +279,7 @@ async function createOrderHandler(req, res) {
       if (note) li.note = note;
       line_items.push(li);
 
-      // Build human chunk: "one single burger with cheese, no onions"
-      const itemText = varToFront(chosen.label); // "single burger"
+      const itemText = varToFront(chosen.label);
       const qtyText = toWord(qty);
       const withText = modNames.length ? ` with ${joinList(modNames)}` : '';
       const noText   = noNames.length  ? (withText ? `, no ${joinList(noNames)}` : ` with no ${joinList(noNames)}`) : '';
@@ -315,11 +304,12 @@ async function createOrderHandler(req, res) {
       idempotency_key: crypto.randomUUID(),
       order: {
         location_id: LOCATION_ID,
+        state: 'OPEN',
         line_items,
         fulfillments: [fulfillment],
         note: order_notes,
         reference_id: customer_phone || undefined,
-        source: { name: 'Phone Assistant' }
+        source: { name: 'Phone Assistant' } // note: for labeling only, not visibility
       }
     };
 
@@ -334,13 +324,12 @@ async function createOrderHandler(req, res) {
       return res.status(r.status).json({ success: false, error: json });
     }
 
-    // Natural-language confirmation for the voice agent to read verbatim.
     const spoken = `You’re all set, ${customer_name}. ${joinList(speak_chunks)}. Thanks—see you soon.`;
 
     res.json({
       success: true,
       orderId: json.order?.id || null,
-      summary_tts: spoken    // the assistant should speak this and then end the call.
+      summary_tts: spoken
     });
   } catch (e) {
     console.error('[create-order] error', e);
@@ -349,11 +338,33 @@ async function createOrderHandler(req, res) {
 }
 app.post('/api/create-order', createOrderHandler);
 
-// ---- Route aliases ----
+// ---- Search recent orders (visibility sanity-check) ----
+app.get('/api/orders/recent', async (_req, res) => {
+  try {
+    if (!okCfg()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
+    const body = {
+      location_ids: [LOCATION_ID],
+      query: { sort: { sort_field: 'CREATED_AT', sort_order: 'DESC' } },
+      limit: 20
+    };
+    const r = await fetch(`${BASE}/v2/orders/search`, {
+      method: 'POST',
+      headers: SQ_HEADERS,
+      body: JSON.stringify(body)
+    });
+    const j = await r.json();
+    if (!r.ok) return res.status(r.status).json({ success: false, error: j });
+    res.json({ success: true, orders: j.orders || [] });
+  } catch (e) {
+    res.status(500).json({ success: false, error: String(e) });
+  }
+});
+
+// ---- Aliases ----
 app.get('/square/getMenu', (req, res) => getMenuHandler(req, res));
 app.post('/square/createOrder', (req, res) => createOrderHandler(req, res));
 
-// ---- Warm the catalog so first call isn't slow ----
+// ---- Warm the catalog ----
 const WARM_INTERVAL_MS = 4 * 60 * 1000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server listening on ${PORT} (env=${ENV})`);
