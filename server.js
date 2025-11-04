@@ -1,4 +1,4 @@
-// server.js — Node 18+, ESM. Square pickup orders with natural-language summary.
+// server.js — Node 18+, ESM. Phone pickup orders that SHOW in Square by recording an EXTERNAL payment.
 
 import express from 'express';
 import crypto from 'crypto';
@@ -18,6 +18,7 @@ const BASE = ENV === 'production'
 const ACCESS_TOKEN = process.env.SQUARE_ACCESS_TOKEN || '';
 const LOCATION_ID  = process.env.SQUARE_LOCATION_ID  || '';
 const INBOUND_KEY  = process.env.INBOUND_API_KEY || process.env.VAPI_INBOUND_KEY || '';
+const MARK_PAID    = String(process.env.MARK_PAID || '1') === '1';  // set 0 to skip payment in dev
 
 const SQ_HEADERS = {
   'Content-Type': 'application/json',
@@ -51,7 +52,7 @@ app.get('/selfcheck', async (_req, res) => {
   }
 });
 
-// ---- Inbound gate ----
+// ---- Inbound gate (shared secret from VAPI) ----
 app.use((req, res, next) => {
   const auth = req.get('authorization') || '';
   const bearer = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7) : '';
@@ -62,7 +63,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- Synonyms ----
+// ---- Synonyms (kept tight) ----
 const SYNONYMS = [
   { test: /^cheeseburger$/i, base: 'Burger', addMods: ['add cheese'] },
   { test: /^hamburger$/i,    base: 'Burger', addMods: [] },
@@ -78,104 +79,97 @@ const applySynonym = (name) => {
 
 // ---- Catalog cache (ITEM, VARIATION, MODIFIER_LIST, MODIFIER) ----
 const TTL = 300_000; // 5 minutes
-let cache = { at: 0, items: null, itemAllowedMods: null, modIdToName: null, refreshing: null };
+let cache = { at: 0, items: null, itemAllowedMods: null, refreshing: null };
 
 async function fetchCatalog() {
   const now = Date.now();
-  if (cache.items && cache.itemAllowedMods && cache.modIdToName && now - cache.at < TTL) return cache;
-  if (cache.refreshing) return cache.refreshing;
+  if (cache.items && cache.itemAllowedMods && now - cache.at < TTL) return cache;
 
-  cache.refreshing = (async () => {
-    const objs = [];
-    let cursor = null;
-    do {
-      const url = `${BASE}/v2/catalog/list?types=ITEM,ITEM_VARIATION,MODIFIER_LIST,MODIFIER` +
-                  (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
-      const r = await fetch(url, { headers: SQ_HEADERS });
-      const json = await r.json();
-      if (!r.ok) throw new Error(`catalog list ${r.status}: ${JSON.stringify(json)}`);
-      if (json.objects?.length) objs.push(...json.objects);
-      cursor = json.cursor || null;
-    } while (cursor);
+  const objs = [];
+  let cursor = null;
+  do {
+    const url = `${BASE}/v2/catalog/list?types=ITEM,ITEM_VARIATION,MODIFIER_LIST,MODIFIER` +
+                (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
+    const r = await fetch(url, { headers: SQ_HEADERS });
+    const json = await r.json();
+    if (!r.ok) throw new Error(`catalog list ${r.status}: ${JSON.stringify(json)}`);
+    if (json.objects?.length) objs.push(...json.objects);
+    cursor = json.cursor || null;
+  } while (cursor);
 
-    const itemsById = new Map();
-    const itemNameById = new Map();
-    const variations = [];
-    const modifierLists = new Map();
-    const modifiersByList = new Map();
-    const modIdToName = new Map();
+  const itemsById = new Map();
+  const itemNameById = new Map();
+  const variations = [];
+  const modifierLists = new Map();
+  const modifiersByList = new Map();
 
-    for (const o of objs) {
-      if (o.type === 'ITEM') {
-        itemsById.set(o.id, o);
-        itemNameById.set(o.id, o.item_data?.name || '');
-      } else if (o.type === 'ITEM_VARIATION') {
-        variations.push(o);
-      } else if (o.type === 'MODIFIER_LIST') {
-        modifierLists.set(o.id, { name: o.modifier_list_data?.name || '', modifiers: [] });
+  for (const o of objs) {
+    if (o.type === 'ITEM') {
+      itemsById.set(o.id, o);
+      itemNameById.set(o.id, o.item_data?.name || '');
+    } else if (o.type === 'ITEM_VARIATION') {
+      variations.push(o);
+    } else if (o.type === 'MODIFIER_LIST') {
+      modifierLists.set(o.id, { name: o.modifier_list_data?.name || '', modifiers: [] });
+    }
+  }
+  for (const o of objs) {
+    if (o.type === 'MODIFIER') {
+      const listId = o.modifier_data?.modifier_list_id;
+      if (!listId) continue;
+      const m = { id: o.id, name: o.modifier_data?.name || '' };
+      const arr = modifiersByList.get(listId) || [];
+      arr.push(m);
+      modifiersByList.set(listId, arr);
+    }
+  }
+  for (const [listId, mods] of modifiersByList) {
+    if (modifierLists.has(listId)) modifierLists.get(listId).modifiers = mods;
+  }
+
+  const itemsOut = [];
+  const itemAllowedMods = new Map(); // itemId -> Map(keyword -> {id,name})
+
+  for (const v of variations) {
+    const vd = v.item_variation_data || {};
+    const itemId = vd.item_id;
+    const baseName = itemNameById.get(itemId);
+    const varName  = vd.name || 'Regular';
+    const cents    = vd.price_money?.amount;
+    if (!baseName || cents == null) continue;
+
+    itemsOut.push({
+      itemId,
+      name: baseName,
+      variationId: v.id,
+      priceCents: cents,
+      price: (cents / 100).toFixed(2),
+      label: `${baseName} - ${varName}`
+    });
+
+    const item = itemsById.get(itemId);
+    const listInfo = item?.item_data?.modifier_list_info || [];
+    const modMap = itemAllowedMods.get(itemId) || new Map();
+    for (const li of listInfo) {
+      const listId = li.modifier_list_id;
+      const list = modifierLists.get(listId);
+      if (!list) continue;
+      for (const m of list.modifiers) {
+        const n = norm(m.name);
+        const val = { id: m.id, name: m.name };
+        modMap.set(n, val);
+        modMap.set(baseWord(n), val);
       }
     }
-    for (const o of objs) {
-      if (o.type === 'MODIFIER') {
-        const listId = o.modifier_data?.modifier_list_id;
-        if (!listId) continue;
-        const m = { id: o.id, name: o.modifier_data?.name || '' };
-        const arr = modifiersByList.get(listId) || [];
-        arr.push(m);
-        modifiersByList.set(listId, arr);
-        modIdToName.set(m.id, m.name);
-      }
-    }
-    for (const [listId, mods] of modifiersByList) {
-      if (modifierLists.has(listId)) modifierLists.get(listId).modifiers = mods;
-    }
+    if (modMap.size) itemAllowedMods.set(itemId, modMap);
+  }
 
-    const itemsOut = [];
-    const itemAllowedMods = new Map(); // itemId -> Map(keyword -> {id,name})
-
-    for (const v of variations) {
-      const vd = v.item_variation_data || {};
-      const itemId = vd.item_id;
-      const baseName = itemNameById.get(itemId);
-      const varName  = vd.name || 'Regular';
-      const cents    = vd.price_money?.amount;
-      if (!baseName || cents == null) continue;
-
-      itemsOut.push({
-        itemId,
-        name: baseName,
-        variationId: v.id,
-        priceCents: cents,
-        price: (cents / 100).toFixed(2),
-        label: `${baseName} - ${varName}`
-      });
-
-      const item = itemsById.get(itemId);
-      const listInfo = item?.item_data?.modifier_list_info || [];
-      const modMap = itemAllowedMods.get(itemId) || new Map();
-      for (const li of listInfo) {
-        const listId = li.modifier_list_id;
-        const list = modifierLists.get(listId);
-        if (!list) continue;
-        for (const m of list.modifiers) {
-          const n = norm(m.name);
-          const val = { id: m.id, name: m.name };
-          modMap.set(n, val);
-          modMap.set(baseWord(n), val);
-        }
-      }
-      if (modMap.size) itemAllowedMods.set(itemId, modMap);
-    }
-
-    itemsOut.sort((a, b) => a.label.localeCompare(b.label));
-    cache = { at: Date.now(), items: itemsOut, itemAllowedMods, modIdToName, refreshing: null };
-    return cache;
-  })();
-
-  return cache.refreshing;
+  itemsOut.sort((a, b) => a.label.localeCompare(b.label));
+  cache = { at: Date.now(), items: itemsOut, itemAllowedMods, refreshing: null };
+  return cache;
 }
 
-// ---- Helpers for natural language summary ----
+// ---- Helpers for human summary ----
 const NUM_WORD = ['zero','one','two','three','four','five','six','seven','eight','nine','ten'];
 const toWord = (n) => (n>=0 && n<=10) ? NUM_WORD[n] : String(n);
 
@@ -231,6 +225,7 @@ async function createOrderHandler(req, res) {
       const syn = applySynonym(reqName);
       if (syn) { reqName = syn.base; extraMods = syn.addMods || []; hint = syn.hint; }
 
+      // Resolve variation
       let chosen = null;
       if (it.variationId) {
         chosen = byId.get(it.variationId) || null;
@@ -241,9 +236,7 @@ async function createOrderHandler(req, res) {
           chosen = menu.find(m => norm(m.label) === norm(tryLabel)) || null;
         }
         chosen = chosen || menu.find(m => norm(m.name) === q) || menu.find(m => norm(m.label).startsWith(`${q} -`)) || null;
-        if (!chosen && hint) {
-          chosen = menu.find(m => norm(m.label).includes(norm(hint))) || null;
-        }
+        if (!chosen && hint) chosen = menu.find(m => norm(m.label).includes(norm(hint))) || null;
       }
       if (!chosen) continue;
 
@@ -304,31 +297,65 @@ async function createOrderHandler(req, res) {
       idempotency_key: crypto.randomUUID(),
       order: {
         location_id: LOCATION_ID,
-        state: 'OPEN',
         line_items,
         fulfillments: [fulfillment],
         note: order_notes,
         reference_id: customer_phone || undefined,
-        source: { name: 'Phone Assistant' } // note: for labeling only, not visibility
+        source: { name: 'Phone Assistant' }
       }
     };
 
+    // --- Create the order ---
     const r = await fetch(`${BASE}/v2/orders`, {
       method: 'POST',
       headers: SQ_HEADERS,
       body: JSON.stringify(payload)
     });
-    const json = await r.json();
+    const created = await r.json();
     if (!r.ok) {
-      console.error('[create-order] failed', r.status, json?.errors || json);
-      return res.status(r.status).json({ success: false, error: json });
+      console.error('[create-order] failed', r.status, created?.errors || created);
+      return res.status(r.status).json({ success: false, error: created });
     }
 
+    const orderId = created.order?.id || null;
+    const amount  = created.order?.total_money?.amount ?? 0;
+    const currency = created.order?.total_money?.currency ?? 'USD';
+
+    // --- Record an EXTERNAL payment so the order shows up in Dashboard/POS ---
+    let paymentId = null;
+    if (MARK_PAID && orderId && amount > 0) {
+      const payPayload = {
+        idempotency_key: crypto.randomUUID(),
+        location_id: LOCATION_ID,
+        order_id: orderId,
+        amount_money: { amount, currency },
+        source_id: 'EXTERNAL',
+        autocomplete: true,
+        external_details: {
+          type: 'OTHER',                 // we’re not charging a card here
+          source: 'Phone order via AVA'  // shows in UI
+        }
+      };
+      const pr = await fetch(`${BASE}/v2/payments`, {
+        method: 'POST',
+        headers: SQ_HEADERS,
+        body: JSON.stringify(payPayload)
+      });
+      const pj = await pr.json();
+      if (!pr.ok) {
+        console.error('[record-external-payment] failed', pr.status, pj?.errors || pj);
+      } else {
+        paymentId = pj.payment?.id || null;
+      }
+    }
+
+    // Natural-language confirmation for the voice agent to read verbatim, then hang up.
     const spoken = `You’re all set, ${customer_name}. ${joinList(speak_chunks)}. Thanks—see you soon.`;
 
     res.json({
       success: true,
-      orderId: json.order?.id || null,
+      orderId,
+      paymentId,
       summary_tts: spoken
     });
   } catch (e) {
@@ -337,28 +364,6 @@ async function createOrderHandler(req, res) {
   }
 }
 app.post('/api/create-order', createOrderHandler);
-
-// ---- Search recent orders (visibility sanity-check) ----
-app.get('/api/orders/recent', async (_req, res) => {
-  try {
-    if (!okCfg()) return res.status(500).json({ success: false, error: 'Square credentials not configured' });
-    const body = {
-      location_ids: [LOCATION_ID],
-      query: { sort: { sort_field: 'CREATED_AT', sort_order: 'DESC' } },
-      limit: 20
-    };
-    const r = await fetch(`${BASE}/v2/orders/search`, {
-      method: 'POST',
-      headers: SQ_HEADERS,
-      body: JSON.stringify(body)
-    });
-    const j = await r.json();
-    if (!r.ok) return res.status(r.status).json({ success: false, error: j });
-    res.json({ success: true, orders: j.orders || [] });
-  } catch (e) {
-    res.status(500).json({ success: false, error: String(e) });
-  }
-});
 
 // ---- Aliases ----
 app.get('/square/getMenu', (req, res) => getMenuHandler(req, res));
