@@ -1,9 +1,12 @@
 import express from "express";
 import dotenv from "dotenv";
 import crypto from "crypto";
-import { Client, Environment } from "square";
 import path, { dirname } from "path";
 import { fileURLToPath } from "url";
+
+// Square SDK is CommonJS → import default then destructure
+import square from "square";
+const { Client, Environment, WebhooksHelper } = square;
 
 dotenv.config();
 
@@ -30,13 +33,13 @@ const { catalogApi, ordersApi, terminalsApi, inventoryApi } = client;
 // ---- Health
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// ---- GET /menu (live catalog + inventory)
+// ---- GET /menu  (live catalog + inventory overlay)
 app.get("/menu", async (_req, res) => {
   try {
     const { result } = await catalogApi.searchCatalogObjects({
       objectTypes: [
-        "ITEM","ITEM_VARIATION","MODIFIER_LIST","MODIFIER",
-        "CATEGORY","TAX","IMAGE","ITEM_OPTION"
+        "ITEM", "ITEM_VARIATION", "MODIFIER_LIST", "MODIFIER",
+        "CATEGORY", "TAX", "IMAGE", "ITEM_OPTION"
       ],
       includeRelatedObjects: true,
       includeDeletedObjects: false
@@ -92,7 +95,7 @@ app.get("/menu", async (_req, res) => {
         };
       });
 
-    // Inventory overlay
+    // Inventory overlay (sold-out flag)
     const variationIds = items.flatMap(i => i.variations.map(v => v.id));
     let counts = [];
     if (variationIds.length) {
@@ -116,7 +119,7 @@ app.get("/menu", async (_req, res) => {
   }
 });
 
-// ---- POST /checkout (Order -> Terminal Checkout)
+// ---- POST /checkout  (Order -> Terminal Checkout)
 app.post("/checkout", async (req, res) => {
   try {
     const { lineItems, note, customerName, phone } = req.body ?? {};
@@ -157,7 +160,9 @@ app.post("/checkout", async (req, res) => {
     if (!order?.id) return res.status(500).json({ error: "order_create_failed" });
 
     const totalMoney = order.totalMoney ?? order.netAmounts?.totalMoney;
-    if (!totalMoney?.amount) return res.status(500).json({ error: "order_total_missing" });
+    if (!totalMoney?.amount) {
+      return res.status(500).json({ error: "order_total_missing" });
+    }
 
     const checkoutResp = await terminalsApi.createTerminalCheckout({
       idempotencyKey: crypto.randomUUID(),
@@ -171,16 +176,39 @@ app.post("/checkout", async (req, res) => {
       }
     });
 
-    res.json({ checkoutId: checkoutResp.result.checkout?.id, status: "PENDING_ON_TERMINAL" });
+    res.json({
+      checkoutId: checkoutResp.result.checkout?.id,
+      status: "PENDING_ON_TERMINAL"
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "checkout_start_failed" });
   }
 });
 
+// ---- (Optional) Webhooks endpoint stub
+app.post("/webhooks/square", (req, res) => {
+  try {
+    // If you enable verification, set WEBHOOK_SIGNATURE_KEY and uncomment below:
+    // const sig = req.headers["x-square-hmacsha256-signature"];
+    // const ok = WebhooksHelper.verifySignature({
+    //   signatureKey: process.env.WEBHOOK_SIGNATURE_KEY || "",
+    //   signatureHeader: Array.isArray(sig) ? sig[0] : sig,
+    //   requestBody: JSON.stringify(req.body),
+    //   notificationUrl: "https://YOUR-DOMAIN/webhooks/square"
+    // });
+    // if (!ok) return res.sendStatus(401);
+    res.sendStatus(200);
+  } catch {
+    res.sendStatus(200);
+  }
+});
+
 // ---- Serve built client
 app.use(express.static(clientDist));
-app.get("*", (_req, res) => res.sendFile(path.join(clientDist, "index.html")));
+app.get("*", (_req, res) => {
+  res.sendFile(path.join(clientDist, "index.html"));
+});
 
 const port = Number(process.env.PORT || 8080);
 app.listen(port, () => console.log(`Server running on :${port}`));
