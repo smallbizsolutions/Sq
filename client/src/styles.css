@@ -2,10 +2,5 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Simple full screen tap targets for tablet */
-.btn {
-  @apply rounded-2xl px-4 py-3 font-semibold shadow;
-}
-.card {
-  @apply bg-white rounded-2xl p-4 shadow;
-}
+.btn { @apply rounded-2xl px-4 py-3 font-semibold shadow; }
+.card { @apply bg-white rounded-2xl p-4 shadow; }
