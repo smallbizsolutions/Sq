@@ -30,19 +30,13 @@ const { catalogApi, ordersApi, terminalsApi, inventoryApi } = client;
 // ---- Health
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// ---- GET /menu  (live catalog + inventory)
+// ---- GET /menu  (live catalog + inventory overlay)
 app.get("/menu", async (_req, res) => {
   try {
     const { result } = await catalogApi.searchCatalogObjects({
       objectTypes: [
-        "ITEM",
-        "ITEM_VARIATION",
-        "MODIFIER_LIST",
-        "MODIFIER",
-        "CATEGORY",
-        "TAX",
-        "IMAGE",
-        "ITEM_OPTION"
+        "ITEM", "ITEM_VARIATION", "MODIFIER_LIST", "MODIFIER",
+        "CATEGORY", "TAX", "IMAGE", "ITEM_OPTION"
       ],
       includeRelatedObjects: true,
       includeDeletedObjects: false
@@ -58,6 +52,7 @@ app.get("/menu", async (_req, res) => {
       .filter(o => o.type === "ITEM" && !o.isDeleted)
       .map(item => {
         const data = item.itemData;
+
         const variations = (data?.variations ?? [])
           .map(v => byId.get(v.id) || v)
           .filter(v => !v.isDeleted)
@@ -188,12 +183,11 @@ app.post("/checkout", async (req, res) => {
   }
 });
 
-// ---- Static hosting for the kiosk UI (built in postinstall)
+// ---- Serve the built React app
 app.use(express.static(clientDist));
-// API routes are above; SPA fallback below:
-app.get("*", (req, res) =>
-  res.sendFile(path.join(clientDist, "index.html"))
-);
+app.get("*", (_req, res) => {
+  res.sendFile(path.join(clientDist, "index.html"));
+});
 
 const port = Number(process.env.PORT || 5175);
 app.listen(port, () => console.log(`Server running on :${port}`));
