@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 
-const API = (path) =>
-  `${import.meta.env.VITE_API_BASE || ""}${path}`;
+// single-service: same-origin API
+const API = (path) => path;
 
 const money = (m) =>
   m && typeof m.amount !== "undefined" ? `$${(Number(m.amount) / 100).toFixed(2)}` : "";
@@ -20,10 +20,7 @@ export default function App() {
       .catch(() => setError("Failed to load menu"));
   }, []);
 
-  const categories = useMemo(() => {
-    // Simple: All only. If you want category chips, add them from menu.categories.
-    return ["all"];
-  }, [menu]);
+  const categories = useMemo(() => ["all"], [menu]);
 
   const filtered = useMemo(() => {
     if (category === "all") return menu.items;
@@ -79,8 +76,6 @@ export default function App() {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "checkout_failed");
-
-      // Payment happens on the Terminal. Clear cart & show status.
       setCart([]);
       alert("Please complete payment on the card reader.");
     } catch (e) {
