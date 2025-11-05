@@ -1,7 +1,10 @@
 import React, { useEffect, useMemo, useState } from "react";
 
+const API = (path) =>
+  `${import.meta.env.VITE_API_BASE || ""}${path}`;
+
 const money = (m) =>
-  m ? `$${(Number(m.amount) / 100).toFixed(2)}` : "";
+  m && typeof m.amount !== "undefined" ? `$${(Number(m.amount) / 100).toFixed(2)}` : "";
 
 export default function App() {
   const [menu, setMenu] = useState({ items: [] });
@@ -11,14 +14,14 @@ export default function App() {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    fetch("/menu")
+    fetch(API("/menu"))
       .then((r) => r.json())
       .then(setMenu)
       .catch(() => setError("Failed to load menu"));
   }, []);
 
   const categories = useMemo(() => {
-    // Items may not carry category names; keep a simple “All” for now.
+    // Simple: All only. If you want category chips, add them from menu.categories.
     return ["all"];
   }, [menu]);
 
@@ -37,20 +40,18 @@ export default function App() {
         itemName: item.name,
         catalogObjectId: variationId,
         modifiers: selectedMods.map((id) => ({ catalogObjectId: id, quantity: "1" })),
-        quantity: 1,
-      },
+        quantity: 1
+      }
     ]);
   };
 
   const total = useMemo(() => {
-    // rough client-side total for display — real total comes from Square Order
     let cents = 0;
     for (const line of cart) {
       const item = menu.items.find((i) => i.id === line.itemId);
       const variation = item?.variations.find((v) => v.id === line.catalogObjectId);
-      cents += (Number(variation?.priceMoney?.amount ?? 0)) * line.quantity;
+      cents += Number(variation?.priceMoney?.amount ?? 0) * line.quantity;
       for (const m of line.modifiers) {
-        // find the price of each selected modifier
         for (const ml of item?.modifierLists ?? []) {
           const mm = ml.modifiers.find((x) => x.id === m.catalogObjectId);
           if (mm?.priceMoney?.amount) cents += Number(mm.priceMoney.amount) * line.quantity;
@@ -64,7 +65,7 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
-      const response = await fetch("/checkout", {
+      const response = await fetch(API("/checkout"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -74,14 +75,14 @@ export default function App() {
             modifiers: c.modifiers
           })),
           note: "Kiosk order"
-        }),
+        })
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "checkout_failed");
 
-      // Optional: poll or rely on webhooks. Here we just show a simple status.
-      alert("Sent to Terminal. Complete payment on the card reader.");
+      // Payment happens on the Terminal. Clear cart & show status.
       setCart([]);
+      alert("Please complete payment on the card reader.");
     } catch (e) {
       console.error(e);
       setError("Payment start failed. Check device pairing & totals.");
@@ -153,7 +154,7 @@ export default function App() {
 
 function ItemCard({ item, onAdd }) {
   const [variationId, setVariationId] = useState(item.variations?.[0]?.id ?? "");
-  const [selected, setSelected] = useState({}); // { modifierListId: Set(modifierId) }
+  const [selected, setSelected] = useState({}); // { [modifierListId]: Set(modifierId) }
 
   const toggle = (listId, modId) => {
     setSelected((s) => {
@@ -164,8 +165,7 @@ function ItemCard({ item, onAdd }) {
     });
   };
 
-  const selectedMods = Object.values(selected)
-    .flatMap((set) => Array.from(set));
+  const selectedMods = Object.values(selected).flatMap((set) => Array.from(set));
 
   return (
     <div className="card flex flex-col gap-3">
