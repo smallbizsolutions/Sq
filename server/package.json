@@ -1,6 +1,6 @@
 {
   "name": "square-kiosk-server",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
   "engines": { "node": ">=18.17" },
@@ -11,6 +11,6 @@
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "square": "^43.2.0"   // <-- change was here
+    "square": "^43.2.0"
   }
 }
