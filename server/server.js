@@ -30,13 +30,13 @@ const { catalogApi, ordersApi, terminalsApi, inventoryApi } = client;
 // ---- Health
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// ---- GET /menu  (live catalog + inventory overlay)
+// ---- GET /menu (live catalog + inventory)
 app.get("/menu", async (_req, res) => {
   try {
     const { result } = await catalogApi.searchCatalogObjects({
       objectTypes: [
-        "ITEM", "ITEM_VARIATION", "MODIFIER_LIST", "MODIFIER",
-        "CATEGORY", "TAX", "IMAGE", "ITEM_OPTION"
+        "ITEM","ITEM_VARIATION","MODIFIER_LIST","MODIFIER",
+        "CATEGORY","TAX","IMAGE","ITEM_OPTION"
       ],
       includeRelatedObjects: true,
       includeDeletedObjects: false
@@ -116,7 +116,7 @@ app.get("/menu", async (_req, res) => {
   }
 });
 
-// ---- POST /checkout  (Order -> Terminal Checkout)
+// ---- POST /checkout (Order -> Terminal Checkout)
 app.post("/checkout", async (req, res) => {
   try {
     const { lineItems, note, customerName, phone } = req.body ?? {};
@@ -157,9 +157,7 @@ app.post("/checkout", async (req, res) => {
     if (!order?.id) return res.status(500).json({ error: "order_create_failed" });
 
     const totalMoney = order.totalMoney ?? order.netAmounts?.totalMoney;
-    if (!totalMoney?.amount) {
-      return res.status(500).json({ error: "order_total_missing" });
-    }
+    if (!totalMoney?.amount) return res.status(500).json({ error: "order_total_missing" });
 
     const checkoutResp = await terminalsApi.createTerminalCheckout({
       idempotencyKey: crypto.randomUUID(),
@@ -173,21 +171,16 @@ app.post("/checkout", async (req, res) => {
       }
     });
 
-    res.json({
-      checkoutId: checkoutResp.result.checkout?.id,
-      status: "PENDING_ON_TERMINAL"
-    });
+    res.json({ checkoutId: checkoutResp.result.checkout?.id, status: "PENDING_ON_TERMINAL" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "checkout_start_failed" });
   }
 });
 
-// ---- Serve the built React app
+// ---- Serve built client
 app.use(express.static(clientDist));
-app.get("*", (_req, res) => {
-  res.sendFile(path.join(clientDist, "index.html"));
-});
+app.get("*", (_req, res) => res.sendFile(path.join(clientDist, "index.html")));
 
-const port = Number(process.env.PORT || 5175);
+const port = Number(process.env.PORT || 8080);
 app.listen(port, () => console.log(`Server running on :${port}`));
