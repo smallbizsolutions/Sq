@@ -6,7 +6,7 @@
   "engines": { "node": ">=18.17" },
   "scripts": {
     "dev": "node server.js",
-    "postinstall": "npm --prefix ../client ci && npm --prefix ../client run build",
+    "postinstall": "npm --prefix ../client ci || npm --prefix ../client install && npm --prefix ../client run build",
     "start": "NODE_ENV=production node server.js"
   },
   "dependencies": {
